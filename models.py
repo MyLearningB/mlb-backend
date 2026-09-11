@@ -54,39 +54,71 @@ class User(SQLModel, table=True):
     hashed_password: str
     is_verified: bool = False
     token_version: int = Field(default=1)
-    
-    # Profile Settings
+
     username: Optional[str] = Field(default=None, unique=True, index=True)
     bio: Optional[str] = Field(default=None, max_length=120)
     study_goal: Optional[str] = None
+
+    # True until onboarding is successfully completed.
     is_first_session: bool = True
-    fcm_token: Optional[str] = Field(default=None) 
-    
-    # Application Settings 
-    srs_intensity: str = Field(default="Standard") 
+
+    fcm_token: Optional[str] = Field(default=None)
+
+    srs_intensity: str = Field(default="Standard")
     daily_goal_mins: int = Field(default=30)
     public_profile: bool = Field(default=True)
     push_notifications: bool = Field(default=True)
     quest_updates: bool = Field(default=True)
     access_requests_alerts: bool = Field(default=True)
 
-    # Streak Tracking
     current_streak: int = Field(default=0)
     longest_streak: int = Field(default=0)
     last_active_date: Optional[date] = Field(default=None)
-    
-    # Relationships
-    pets: List["Pet"] = Relationship(back_populates="user", cascade_delete=True)
-    quests: List["Quest"] = Relationship(back_populates="user", cascade_delete=True)
-    study_plans: List["StudyPlan"] = Relationship(back_populates="user", cascade_delete=True)
-    study_sets: List["StudySet"] = Relationship(back_populates="user", cascade_delete=True)
-    notes: List["Note"] = Relationship(back_populates="user", cascade_delete=True)
-    canvases: List["Canvas"] = Relationship(back_populates="user", cascade_delete=True)
-    reminders: List["Reminder"] = Relationship(back_populates="user", cascade_delete=True)
-    
-    # NEW: Multiplayer Relationships
-    study_groups: List["StudyGroup"] = Relationship(back_populates="members", link_model=GroupMember)
-    relics: List["Relic"] = Relationship(back_populates="users", link_model=UserRelic)
+
+    pets: List["Pet"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    quests: List["Quest"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    study_plans: List["StudyPlan"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    study_sets: List["StudySet"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    notes: List["Note"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    canvases: List["Canvas"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    reminders: List["Reminder"] = Relationship(
+        back_populates="user",
+        cascade_delete=True
+    )
+
+    study_groups: List["StudyGroup"] = Relationship(
+        back_populates="members",
+        link_model=GroupMember
+    )
+
+    relics: List["Relic"] = Relationship(
+        back_populates="users",
+        link_model=UserRelic
+    )
 
 class Pet(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
