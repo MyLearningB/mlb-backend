@@ -337,3 +337,6 @@ class NodeUpdate(BaseModel):
     size: Optional[str] = None
     is_hero: Optional[bool] = None
     is_weak: Optional[bool] = None  
+ 
+class GoogleLoginRequest(BaseModel):
+    id_token: str

@@ -1,4 +1,5 @@
 import os
+import secrets
 
 import resend
 
@@ -31,6 +32,23 @@ from schemas import (
     ForgotPasswordRequest,
     ResetPasswordRequest,
 )
+
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+
+# ============================================================
+# GOOGLE OAUTH CONFIG
+# ============================================================
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+if not GOOGLE_CLIENT_ID:
+    print("WARNING: GOOGLE_CLIENT_ID is not configured.")
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
 
 
 # ============================================================
@@ -123,14 +141,10 @@ def register_user(
     """
     Create a new account.
 
-    IMPORTANT:
-    A newly registered user has NOT completed onboarding.
+    Newly registered users have not completed onboarding.
 
     Therefore:
         is_first_session = True
-
-    The Flutter app uses this backend value to decide
-    whether the user should enter onboarding.
     """
 
     email = (
@@ -150,7 +164,6 @@ def register_user(
     ).first()
 
     if existing_user:
-
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -175,20 +188,8 @@ def register_user(
         name=user_data.name.strip(),
         email=email,
         hashed_password=hashed_password,
-
-        # ----------------------------------------------------
-        # ONBOARDING STATE
-        #
-        # New users MUST complete onboarding.
-        # ----------------------------------------------------
-
         is_verified=True,
         is_first_session=True,
-
-        # ----------------------------------------------------
-        # JWT REVOCATION VERSION
-        # ----------------------------------------------------
-
         token_version=1,
     )
 
@@ -198,7 +199,6 @@ def register_user(
         session.commit()
 
     except Exception:
-
         session.rollback()
 
         raise HTTPException(
@@ -242,8 +242,6 @@ def register_user(
             "id": new_user.id,
             "email": new_user.email,
             "name": new_user.name,
-
-            # Backend is the source of truth.
             "is_first_session": (
                 new_user.is_first_session
             ),
@@ -268,17 +266,7 @@ def login_user(
     """
     Authenticate an existing user.
 
-    IMPORTANT:
-    The backend decides whether onboarding is complete.
-
-    Flutter should NOT try to infer onboarding state from
-    local storage.
-
-    Flutter should simply read:
-
-        user.is_first_session
-
-    from this response.
+    Backend is the source of truth for onboarding state.
     """
 
     email = (
@@ -308,7 +296,6 @@ def login_user(
             db_user.hashed_password,
         )
     ):
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=(
@@ -350,17 +337,6 @@ def login_user(
             "id": db_user.id,
             "email": db_user.email,
             "name": db_user.name,
-
-            # ------------------------------------------------
-            # THIS IS THE IMPORTANT PART
-            #
-            # If True:
-            #     Flutter -> Quiz
-            #
-            # If False:
-            #     Flutter -> Dashboard
-            # ------------------------------------------------
-
             "is_first_session": (
                 db_user.is_first_session
             ),
@@ -385,26 +361,17 @@ def refresh_access_token(
 
     The user's current token_version must match the
     refresh token's version.
-
-    The current onboarding state is also returned so the
-    Flutter app always has the backend's latest truth.
     """
 
     try:
-
         payload = jwt.decode(
             request.refresh_token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
         )
 
-        email = payload.get(
-            "sub"
-        )
-
-        token_version = payload.get(
-            "version"
-        )
+        email = payload.get("sub")
+        token_version = payload.get("version")
 
         if (
             email is None
@@ -413,7 +380,6 @@ def refresh_access_token(
             raise JWTError
 
     except JWTError:
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token.",
@@ -430,7 +396,6 @@ def refresh_access_token(
     ).first()
 
     if not db_user:
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found.",
@@ -444,7 +409,6 @@ def refresh_access_token(
         db_user.token_version
         != token_version
     ):
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=(
@@ -518,20 +482,13 @@ def forgot_password(
     ).first()
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    # Always return the same response whether the account
-    # exists or not.
-    #
-    # This prevents email enumeration.
+    # PREVENT EMAIL ENUMERATION
     # --------------------------------------------------------
 
     if db_user:
-
-        reset_token = (
-            create_password_reset_token(
-                db_user.email,
-                db_user.token_version,
-            )
+        reset_token = create_password_reset_token(
+            db_user.email,
+            db_user.token_version,
         )
 
         reset_link = (
@@ -555,7 +512,6 @@ def forgot_password(
                 text-align: center;
             "
         >
-
             <h2 style="color: #2196F3;">
                 Password Reset Request
             </h2>
@@ -583,7 +539,6 @@ def forgot_password(
             >
                 Reset Password
             </a>
-
         </div>
         """
 
@@ -614,7 +569,6 @@ def reset_password(
     session: Session = Depends(get_session),
 ):
     try:
-
         payload = jwt.decode(
             request.token,
             SECRET_KEY,
@@ -627,13 +581,8 @@ def reset_password(
         ):
             raise JWTError
 
-        email = payload.get(
-            "sub"
-        )
-
-        token_version = payload.get(
-            "version"
-        )
+        email = payload.get("sub")
+        token_version = payload.get("version")
 
         db_user = session.exec(
             select(User).where(
@@ -649,22 +598,17 @@ def reset_password(
             raise JWTError
 
     except JWTError:
-
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Invalid or expired token."
-            ),
+            detail="Invalid or expired token.",
         )
 
     # --------------------------------------------------------
     # CHANGE PASSWORD
     # --------------------------------------------------------
 
-    db_user.hashed_password = (
-        get_password_hash(
-            request.password
-        )
+    db_user.hashed_password = get_password_hash(
+        request.password
     )
 
     # --------------------------------------------------------
@@ -679,7 +623,6 @@ def reset_password(
         session.commit()
 
     except Exception:
-
         session.rollback()
 
         raise HTTPException(
@@ -691,9 +634,7 @@ def reset_password(
         )
 
     return {
-        "message": (
-            "Password updated successfully."
-        )
+        "message": "Password updated successfully."
     }
 
 
@@ -722,22 +663,17 @@ def change_password(
         request.current_password,
         current_user.hashed_password,
     ):
-
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=(
-                "Incorrect current password"
-            ),
+            detail="Incorrect current password",
         )
 
     # --------------------------------------------------------
     # UPDATE PASSWORD
     # --------------------------------------------------------
 
-    current_user.hashed_password = (
-        get_password_hash(
-            request.new_password
-        )
+    current_user.hashed_password = get_password_hash(
+        request.new_password
     )
 
     # --------------------------------------------------------
@@ -752,7 +688,6 @@ def change_password(
         session.commit()
 
     except Exception:
-
         session.rollback()
 
         raise HTTPException(
@@ -792,9 +727,7 @@ def logout(
     """
     Secure server-side logout.
 
-    Incrementing token_version immediately invalidates
-    all existing access/refresh tokens belonging to
-    the current user.
+    Incrementing token_version invalidates existing tokens.
     """
 
     current_user.token_version += 1
@@ -805,7 +738,6 @@ def logout(
         session.commit()
 
     except Exception:
-
         session.rollback()
 
         raise HTTPException(
@@ -818,7 +750,266 @@ def logout(
 
     return {
         "logged_out": True,
-        "message": (
-            "Successfully logged out securely."
-        ),
+        "message": "Successfully logged out securely.",
     }
+
+
+# ============================================================
+# GOOGLE LOGIN
+# ============================================================
+
+@router.post(
+    "/google",
+    response_model=TokenResponse,
+)
+@limiter.limit("5/minute")
+def google_login(
+    request: Request,
+    body: GoogleLoginRequest,
+    session: Session = Depends(get_session),
+):
+    """
+    Authenticate a user with a Google ID token.
+
+    Flutter sends:
+
+        {
+            "id_token": "GOOGLE_ID_TOKEN"
+        }
+
+    Google verifies the token and returns the user's identity.
+
+    The backend then:
+        1. Finds the user by email.
+        2. Creates the user if they don't exist.
+        3. Creates this application's JWT access token.
+        4. Creates this application's refresh token.
+        5. Returns onboarding state.
+    """
+
+    # ========================================================
+    # CHECK GOOGLE CONFIG
+    # ========================================================
+
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "Google authentication is not configured "
+                "on the server."
+            ),
+        )
+
+    # ========================================================
+    # VERIFY GOOGLE ID TOKEN
+    # ========================================================
+
+    try:
+        id_info = id_token.verify_oauth2_token(
+            body.id_token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+
+    except ValueError as e:
+        print(
+            f"❌ GOOGLE TOKEN VERIFICATION FAILED: {e}"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Invalid or expired Google authentication token."
+            ),
+        )
+
+    except Exception as e:
+        print(
+            f"❌ GOOGLE TOKEN VERIFICATION ERROR: {e}"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Could not verify Google authentication."
+            ),
+        )
+
+    # ========================================================
+    # GET GOOGLE USER INFORMATION
+    # ========================================================
+
+    email = id_info.get("email")
+    name = id_info.get("name")
+
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Google did not provide an email address."
+            ),
+        )
+
+    email = email.strip().lower()
+
+    if not name:
+        name = "Google User"
+
+    name = name.strip()
+
+    # ========================================================
+    # OPTIONAL: CHECK VERIFIED EMAIL
+    # ========================================================
+
+    email_verified = id_info.get(
+        "email_verified",
+        False,
+    )
+
+    if not email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Your Google email address is not verified."
+            ),
+        )
+
+    # ========================================================
+    # FIND EXISTING USER
+    # ========================================================
+
+    db_user = session.exec(
+        select(User).where(
+            User.email == email
+        )
+    ).first()
+
+    # ========================================================
+    # CREATE USER IF IT DOESN'T EXIST
+    # ========================================================
+
+    if not db_user:
+
+        random_password = secrets.token_urlsafe(32)
+
+        hashed_password = get_password_hash(
+            random_password
+        )
+
+        db_user = User(
+            name=name,
+            email=email,
+            hashed_password=hashed_password,
+
+            # Google already verified the identity.
+            is_verified=True,
+
+            # New Google users still need onboarding.
+            is_first_session=True,
+
+            token_version=1,
+        )
+
+        session.add(db_user)
+
+        try:
+            session.commit()
+            session.refresh(db_user)
+
+        except Exception as e:
+            session.rollback()
+
+            print(
+                f"❌ GOOGLE USER CREATION ERROR: {e}"
+            )
+
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Could not create your account. "
+                    "Please try again."
+                ),
+            )
+
+    else:
+
+        # ====================================================
+        # EXISTING USER
+        # ====================================================
+
+        # Ensure Google authentication marks the account
+        # as verified.
+        if not db_user.is_verified:
+            db_user.is_verified = True
+
+            session.add(db_user)
+
+            try:
+                session.commit()
+                session.refresh(db_user)
+
+            except Exception as e:
+                session.rollback()
+
+                print(
+                    f"❌ GOOGLE USER UPDATE ERROR: {e}"
+                )
+
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "Could not update your account. "
+                        "Please try again."
+                    ),
+                )
+
+    # ========================================================
+    # CREATE APP ACCESS TOKEN
+    # ========================================================
+
+    access_token = create_access_token(
+        data={
+            "sub": db_user.email
+        },
+        version=db_user.token_version,
+    )
+
+    # ========================================================
+    # CREATE APP REFRESH TOKEN
+    # ========================================================
+
+    refresh_token = create_refresh_token(
+        data={
+            "sub": db_user.email
+        },
+        version=db_user.token_version,
+    )
+
+    # ========================================================
+    # RESPONSE
+    # ========================================================
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+
+        "user": {
+            "id": db_user.id,
+            "email": db_user.email,
+            "name": db_user.name,
+
+            # Backend remains source of truth.
+            "is_first_session": (
+                db_user.is_first_session
+            ),
+        },
+    }
+
+
+# ============================================================
+# SERVER ERROR HELPER
+# ============================================================
+
+# No additional helper is needed here because errors are
+# returned directly through FastAPI HTTPException.
