@@ -74,6 +74,7 @@ from schemas import (
     PlanStats,
     WeekDay,
     SessionDetail,
+    OnboardingQuizSubmit,
 )
 
 # ============================================================
@@ -102,7 +103,6 @@ from routers import (
 )
 
 from routers.auth import limiter
-
 
 # ============================================================
 # LIFESPAN
@@ -243,19 +243,12 @@ app.add_middleware(
 # ============================================================
 
 app.include_router(auth.router)
-
 app.include_router(study.router)
-
 app.include_router(notes.router)
-
 app.include_router(canvas.router)
-
 app.include_router(collections.router)
-
 app.include_router(notifications.router)
-
 app.include_router(community.router)
-
 app.include_router(trophies.router)
 
 app.include_router(
@@ -298,6 +291,39 @@ def get_local_now(
 
     return datetime.now(tz)
 
+# ============================================================
+# ONBOARDING QUIZ 
+# ============================================================
+
+@app.patch(
+    "/users/me/quiz",
+    status_code=status.HTTP_200_OK,
+    tags=["Profile"]
+)
+def submit_onboarding_quiz(
+    request: OnboardingQuizSubmit,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    current_user.goal_type = request.goal_type
+    current_user.study_goal = request.study_goal
+    current_user.target_date = request.target_date
+    
+    session.add(current_user)
+    
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save quiz preferences."
+        )
+        
+    return {
+        "message": "Study profile updated successfully",
+        "goal_type": current_user.goal_type
+    }
 
 # ============================================================
 # PET ADOPTION
@@ -689,6 +715,9 @@ def get_dashboard(
         today_plan=real_today_plan,
         streak=streak_info,
         greeting=greeting,
+        goal_type=current_user.goal_type,
+        study_goal=current_user.study_goal,
+        target_date=current_user.target_date,
     )
 
 
@@ -752,9 +781,11 @@ def get_study_plan(
         x_timezone
     ).date()
 
-    days_remaining = (
-        db_plan.deadline - today
-    ).days
+    if db_plan.deadline:
+        days_remaining = (db_plan.deadline - today).days
+        days_remaining = max(days_remaining, 0)
+    else:
+        days_remaining = -1
 
     # --------------------------------------------------------
     # PLAN STATS
@@ -772,10 +803,7 @@ def get_study_plan(
     )
 
     stats = PlanStats(
-        days_remaining=max(
-            days_remaining,
-            0,
-        ),
+        days_remaining=days_remaining,
         daily_target_mins=daily_target,
         topics_count=len(db_sessions),
     )
@@ -876,16 +904,15 @@ async def generate_study_plan(
         x_timezone
     ).date()
 
-    days_remaining = (
-        request.deadline - today
-    ).days
+    days_remaining = None
 
-    if days_remaining < 0:
-
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Deadline passed.",
-        )
+    if request.deadline:
+        days_remaining = (request.deadline - today).days
+        if days_remaining < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Deadline passed.",
+            )
 
     # --------------------------------------------------------
     # AI GENERATION

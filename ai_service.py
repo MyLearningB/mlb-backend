@@ -1,9 +1,9 @@
-# ai_service.py
 import json
 import uuid
 import os 
 from dotenv import load_dotenv
 from datetime import date, datetime, timedelta
+from typing import Optional
 from openai import AsyncOpenAI
 
 # This tells Python to look for the .env file and load it
@@ -58,17 +58,14 @@ async def generate_deepseek_solution(question_text: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Solve this: {question_text}"}
             ],
-            response_format={"type": "json_object"} # Forces DeepSeek to output pure JSON
+            response_format={"type": "json_object"} 
         )
 
-        # Parse the JSON string returned by DeepSeek into a Python dictionary
         ai_data = json.loads(response.choices[0].message.content)
         
-        # Add our backend-generated IDs and empty canvas links (we'll build Canvas linking later)
         ai_data["solution_id"] = f"sol_{uuid.uuid4().hex[:8]}"
         ai_data["canvas_links"] = [] 
         
-        # Fallback to ensure confidence score exists
         if "confidence_score" not in ai_data:
             ai_data["confidence_score"] = 0.90
             
@@ -81,16 +78,28 @@ async def generate_deepseek_solution(question_text: str) -> dict:
 # ==========================================
 # 2. AI STUDY PLAN GENERATOR (Screen 9)
 # ==========================================
-async def generate_deepseek_study_plan(goal: str, target_date: date, days_remaining: int) -> dict:
+async def generate_deepseek_study_plan(
+    goal: str, 
+    target_date: Optional[date] = None, 
+    days_remaining: Optional[int] = None
+) -> dict:
     """
     Prompts DeepSeek to generate a structured 7-day study schedule.
+    Adapts dynamically for strict deadlines vs continuous learning.
     """
-    # Calculate a starting date string (today) to help the AI format the week
     today_str = date.today().isoformat()
+    
+    # Dynamic Prompt Logic
+    if target_date and days_remaining is not None:
+        context_prompt = f"Their deadline is in {days_remaining} days ({target_date}). Focus on preparing them for this specific target, escalating difficulty appropriately."
+        stats_days = days_remaining
+    else:
+        context_prompt = "They are learning continuously without a strict deadline. Focus on building a sustainable, consistent foundational routine."
+        stats_days = -1 # Indicates no deadline to the frontend
     
     system_prompt = f"""
     You are myLB AI, an expert academic planner. 
-    The user wants to study for "{goal}". Their deadline is in {days_remaining} days ({target_date}).
+    The user wants to study for "{goal}". {context_prompt}
     Today is {today_str}.
     
     Generate a highly realistic, balanced 7-day study plan starting from today.
@@ -99,7 +108,7 @@ async def generate_deepseek_study_plan(goal: str, target_date: date, days_remain
     You MUST respond in valid JSON format exactly matching this structure:
     {{
       "stats": {{
-        "days_remaining": {days_remaining},
+        "days_remaining": {stats_days},
         "daily_target_mins": 60,
         "topics_count": 5
       }},

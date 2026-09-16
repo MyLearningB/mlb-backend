@@ -26,7 +26,7 @@ class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
-    user: UserBasicInfo  # Replaced 'dict' with our strict schema
+    user: UserBasicInfo
 
 class TokenRefreshRequest(BaseModel):
     refresh_token: str
@@ -57,6 +57,11 @@ class PetAdoptionRequest(BaseModel):
 class FirstSessionUpdate(BaseModel):
     is_first_session: bool
 
+class OnboardingQuizSubmit(BaseModel):
+    goal_type: str 
+    study_goal: Optional[str] = None
+    target_date: Optional[date] = None
+
 # ==========================================
 # DASHBOARD SCHEMAS (SCREEN 3)
 # ==========================================
@@ -80,7 +85,7 @@ class StreakInfo(BaseModel):
 class Quest(BaseModel):
     id: str
     title: str
-    type: str # "coop" or "solo"
+    type: str
     progress: int
     target: int
     members_count: Optional[int] = None 
@@ -89,7 +94,7 @@ class TodayPlanSession(BaseModel):
     id: str
     subject: str
     duration_mins: int
-    mode: str # "flashcard", "feynman", "review"
+    mode: str 
 
 class DashboardResponse(BaseModel):
     user: UserDashboardInfo
@@ -98,13 +103,20 @@ class DashboardResponse(BaseModel):
     today_plan: List[TodayPlanSession]
     streak: StreakInfo
     greeting: str
+    
+    goal_type: Optional[str] = None
+    study_goal: Optional[str] = None
+    target_date: Optional[date] = None
+
+    class Config:
+        populate_by_name = True
 
 # ==========================================
 # STUDY PLAN SCHEMAS (SCREEN 9)
 # ==========================================
 class PlanGoal(BaseModel):
     subject: str
-    deadline: date
+    deadline: Optional[date] = None # <-- Now Optional
 
 class PlanStats(BaseModel):
     days_remaining: int
@@ -112,15 +124,15 @@ class PlanStats(BaseModel):
     topics_count: int
 
 class WeekDay(BaseModel):
-    date: str # e.g., "2026-04-13"
-    day_label: str # e.g., "MON"
+    date: str
+    day_label: str
     has_session: bool
     session_type: Literal["study", "review", "rest"]
 
 class SessionDetail(BaseModel):
     id: str
     date: str
-    time: str # e.g., "14:00"
+    time: str
     subject: str
     duration_mins: int
     mode: Literal["flashcard", "feynman", "review"]
@@ -141,7 +153,7 @@ class PlanResponse(BaseModel):
 
 class PlanGenerateRequest(BaseModel):
     goal: str
-    deadline: date
+    deadline: Optional[date] = None # <-- Now Optional
 
 class SessionUpdateRequest(BaseModel):
     scheduled_time: Optional[str] = None
@@ -248,7 +260,6 @@ class CanvasStatusResponse(BaseModel):
     status: Literal["ready", "processing", "failed"]
     node_count: int
     nodes: List[NodeResponse] = []
-
 
 # ==========================================
 # COLLECTIONS SCHEMAS

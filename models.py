@@ -31,7 +31,7 @@ class NodeSize(str, Enum):
     large = "large"
 
 # ==========================================
-# MULTIPLAYER LINK MODELS (Define first for relationships)
+# MULTIPLAYER LINK MODELS
 # ==========================================
 
 class GroupMember(SQLModel, table=True):
@@ -41,7 +41,7 @@ class GroupMember(SQLModel, table=True):
 class UserRelic(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", primary_key=True)
     relic_id: uuid.UUID = Field(foreign_key="relic.id", primary_key=True)
-    unlocked_at: datetime = Field(default_factory=utc_now) # FIXED
+    unlocked_at: datetime = Field(default_factory=utc_now)
 
 # ==========================================
 # USER & PET MODELS (ONBOARDING)
@@ -57,9 +57,12 @@ class User(SQLModel, table=True):
 
     username: Optional[str] = Field(default=None, unique=True, index=True)
     bio: Optional[str] = Field(default=None, max_length=120)
+    
+    # --- ONBOARDING & GOALS ---
     study_goal: Optional[str] = None
+    goal_type: Optional[str] = Field(default=None)
+    target_date: Optional[date] = Field(default=None)
 
-    # True until onboarding is successfully completed.
     is_first_session: bool = True
 
     fcm_token: Optional[str] = Field(default=None)
@@ -75,50 +78,15 @@ class User(SQLModel, table=True):
     longest_streak: int = Field(default=0)
     last_active_date: Optional[date] = Field(default=None)
 
-    pets: List["Pet"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    quests: List["Quest"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    study_plans: List["StudyPlan"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    study_sets: List["StudySet"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    notes: List["Note"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    canvases: List["Canvas"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    reminders: List["Reminder"] = Relationship(
-        back_populates="user",
-        cascade_delete=True
-    )
-
-    study_groups: List["StudyGroup"] = Relationship(
-        back_populates="members",
-        link_model=GroupMember
-    )
-
-    relics: List["Relic"] = Relationship(
-        back_populates="users",
-        link_model=UserRelic
-    )
+    pets: List["Pet"] = Relationship(back_populates="user", cascade_delete=True)
+    quests: List["Quest"] = Relationship(back_populates="user", cascade_delete=True)
+    study_plans: List["StudyPlan"] = Relationship(back_populates="user", cascade_delete=True)
+    study_sets: List["StudySet"] = Relationship(back_populates="user", cascade_delete=True)
+    notes: List["Note"] = Relationship(back_populates="user", cascade_delete=True)
+    canvases: List["Canvas"] = Relationship(back_populates="user", cascade_delete=True)
+    reminders: List["Reminder"] = Relationship(back_populates="user", cascade_delete=True)
+    study_groups: List["StudyGroup"] = Relationship(back_populates="members", link_model=GroupMember)
+    relics: List["Relic"] = Relationship(back_populates="users", link_model=UserRelic)
 
 class Pet(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -166,7 +134,7 @@ class StudyPlan(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE")
     
     subject: str
-    deadline: date
+    deadline: Optional[date] = None # <-- Now Optional
     is_approved: bool = False
     
     user: Optional["User"] = Relationship(back_populates="study_plans")
@@ -241,7 +209,7 @@ class FeynmanSession(SQLModel, table=True):
     gaps_identified: str = Field(default="[]") 
     strong_points: str = Field(default="[]")
     
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
 
     study_set: Optional["StudySet"] = Relationship(back_populates="feynman_sessions")
     flashcard: Optional["Flashcard"] = Relationship(back_populates="feynman_sessions")
@@ -262,8 +230,8 @@ class Note(SQLModel, table=True):
     snippet: str = Field(default="", max_length=80)
     is_public: bool = Field(default=False)
     
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
-    updated_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     user: Optional["User"] = Relationship(back_populates="notes")
     flashcards: List["Flashcard"] = Relationship(back_populates="note", cascade_delete=True)
@@ -287,7 +255,7 @@ class Canvas(SQLModel, table=True):
     source_id: Optional[int] = Field(default=None, foreign_key="note.id", ondelete="SET NULL")
     
     last_studied_at: Optional[datetime] = Field(default=None)
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
     is_public: bool = Field(default=False)
     
     user: Optional["User"] = Relationship(back_populates="canvases")
@@ -356,8 +324,8 @@ class Collection(SQLModel, table=True):
     share_token: str = Field(default_factory=lambda: uuid.uuid4().hex[:12], unique=True)
     save_count: int = Field(default=0)
     
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
-    updated_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 class CollectionItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -371,7 +339,7 @@ class CollectionAccess(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     collection_id: int = Field(foreign_key="collection.id", ondelete="CASCADE")
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE") 
-    granted_at: datetime = Field(default_factory=utc_now) # FIXED
+    granted_at: datetime = Field(default_factory=utc_now)
 
 class CollectionRequest(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -379,7 +347,7 @@ class CollectionRequest(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE") 
     message: Optional[str] = None
     status: str = Field(default="pending") 
-    requested_at: datetime = Field(default_factory=utc_now) # FIXED
+    requested_at: datetime = Field(default_factory=utc_now)
 
 class Notification(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -390,33 +358,32 @@ class Notification(SQLModel, table=True):
     deep_link: Optional[str] = None 
     is_read: bool = Field(default=False)
     
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
 
 class UserTrophy(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE")
     
     trophy_id: str 
-    earned_at: datetime = Field(default_factory=utc_now) # FIXED
+    earned_at: datetime = Field(default_factory=utc_now)
 
 class Feedback(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE")
     message: str = Field(max_length=1000)
     status: str = Field(default="unread") 
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
 
 # ==========================================
-# NEW: MULTIPLAYER & CO-OP MODELS 
+# MULTIPLAYER & CO-OP MODELS 
 # ==========================================
 
 class StudyGroup(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
     invite_code: str = Field(index=True, unique=True)
-    created_at: datetime = Field(default_factory=utc_now) # FIXED
+    created_at: datetime = Field(default_factory=utc_now)
     
-    # Relationships
     members: List["User"] = Relationship(back_populates="study_groups", link_model=GroupMember)
     active_quests: List["CoopQuest"] = Relationship(back_populates="group", cascade_delete=True)
 
