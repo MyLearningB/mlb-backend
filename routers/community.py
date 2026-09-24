@@ -7,14 +7,12 @@ from pydantic import BaseModel, Field
 
 from database import get_session
 from security import get_current_user
-
-# Import the new models from models.py
 from models import User, Collection, StudyGroup, GroupMember, CoopQuest, Relic, UserRelic
 
 router = APIRouter(prefix="/community", tags=["Community Tab"])
 
 # ==========================================
-# PYDANTIC SCHEMAS (NEW)
+# PYDANTIC SCHEMAS
 # ==========================================
 class GroupCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=50)
@@ -25,8 +23,6 @@ class GroupJoin(BaseModel):
 # ==========================================
 # 1. COLLECTIONS DISCOVERY
 # ==========================================
-
-# FIXED: Removed 'async' to safely run synchronous db.exec() without blocking the event loop
 @router.get("/collections", status_code=status.HTTP_200_OK)
 def get_discover_collections(
     search: Optional[str] = None,
@@ -71,31 +67,31 @@ def get_discover_collections(
 # ==========================================
 # 2. STUDY GROUPS & CO-OP
 # ==========================================
-
 def generate_invite_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
-# FIXED: Uses JSON body (GroupCreate) instead of URL query parameters
 @router.post("/groups", status_code=status.HTTP_201_CREATED)
 def create_group(
     payload: GroupCreate, 
     current_user: User = Depends(get_current_user), 
     db: Session = Depends(get_session)
 ):
-    """Creates a new study group and auto-assigns the creator as a member."""
+    """Creates a new study group and auto-assigns the creator as a member atomically."""
     new_group = StudyGroup(name=payload.name, invite_code=generate_invite_code())
     db.add(new_group)
+    
+    # FIXED: Flush secures the new_group.id without committing the transaction prematurely
+    db.flush() 
+    
+    member = GroupMember(group_id=new_group.id, user_id=current_user.id)
+    db.add(member)
+    
+    # FIXED: A single atomic commit guarantees both records succeed, or neither do
     db.commit()
     db.refresh(new_group)
     
-    # Add creator as member
-    member = GroupMember(group_id=new_group.id, user_id=current_user.id)
-    db.add(member)
-    db.commit()
-    
     return new_group
 
-# FIXED: Uses JSON body (GroupJoin) instead of URL query parameters
 @router.post("/groups/join", status_code=status.HTTP_200_OK)
 def join_group(
     payload: GroupJoin, 
@@ -108,7 +104,6 @@ def join_group(
     if not group:
         raise HTTPException(status_code=404, detail="Invalid invite code")
         
-    # Check if user is already in the group to prevent duplicate entries
     existing = db.exec(select(GroupMember).where(GroupMember.group_id == group.id, GroupMember.user_id == current_user.id)).first()
     if existing:
         return {"message": "You are already a member of this group"}
@@ -120,67 +115,58 @@ def join_group(
 
 @router.get("/quests/active", status_code=status.HTTP_200_OK)
 def get_active_quests(current_user: User = Depends(get_current_user), db: Session = Depends(get_session)):
-    """Returns the formatted JSON exactly as expected by the Flutter Dashboard."""
-    # Find all groups this user belongs to
-    memberships = db.exec(select(GroupMember).where(GroupMember.user_id == current_user.id)).all()
+    """Returns the formatted JSON exactly as expected by the Flutter Dashboard using a single fast query."""
+    
+    # FIXED: Flattens the N+1 loop into a single optimized JOIN and GROUP BY
+    statement = (
+        select(CoopQuest, func.count(GroupMember.user_id).label("member_count"))
+        .join(GroupMember, GroupMember.group_id == CoopQuest.group_id)
+        .where(GroupMember.user_id == current_user.id)
+        .where(CoopQuest.is_completed == False)
+        .group_by(CoopQuest.id)
+    )
+    
+    results = db.exec(statement).all()
+    
+    return {"quests": [
+        {
+            "id": str(quest.id),
+            "title": quest.title,
+            "progress": quest.current_xp,
+            "target": quest.target_xp,
+            "type": "coop",
+            "membersCount": count
+        } for quest, count in results
+    ]}
+
+# ==========================================
+# 3. XP HOOK (Import this into Flashcard/Feynman routers)
+# ==========================================
+def contribute_to_group_quests(user_id: int, xp_amount: int, db: Session):
+    """
+    Hook to pool XP. 
+    Optimized to fetch all relevant quests in one query and commit once.
+    """
+    memberships = db.exec(select(GroupMember).where(GroupMember.user_id == user_id)).all()
     group_ids = [m.group_id for m in memberships]
     
     if not group_ids:
-        return {"quests": []}
+        return
         
-    # Find the active (incomplete) quests for those groups
+    # FIXED: Fetches all active quests for all of the user's groups in a single query
     active_quests = db.exec(
         select(CoopQuest)
         .where(CoopQuest.group_id.in_(group_ids), CoopQuest.is_completed == False)
     ).all()
     
-    formatted_quests = []
-    
-    for q in active_quests:
-        # Count how many members are contributing to this specific quest's group
-        members_count = db.exec(select(func.count(GroupMember.user_id)).where(GroupMember.group_id == q.group_id)).one()
+    for quest in active_quests:
+        quest.current_xp += xp_amount
         
-        formatted_quests.append({
-            "id": str(q.id),
-            "title": q.title,
-            "progress": q.current_xp,
-            "target": q.target_xp,
-            "type": "coop",
-            "membersCount": members_count
-        })
-        
-    return {"quests": formatted_quests}
-
-
-# ==========================================
-# 3. XP HOOK (Import this into Flashcard/Feynman routers)
-# ==========================================
-
-def contribute_to_group_quests(user_id: int, xp_amount: int, db: Session):
-    """
-    Hook to pool XP. 
-    Call this helper in your solo-study endpoints right after adding XP to the user's pet.
-    """
-    memberships = db.exec(select(GroupMember).where(GroupMember.user_id == user_id)).all()
-    
-    for member in memberships:
-        # Look for an active quest in this group
-        quest = db.exec(
-            select(CoopQuest)
-            .where(CoopQuest.group_id == member.group_id, CoopQuest.is_completed == False)
-        ).first()
-        
-        if quest:
-            quest.current_xp += xp_amount
+        if quest.current_xp >= quest.target_xp:
+            quest.is_completed = True
+            # --- Relic Logic Injection Point ---
             
-            # Check if this XP push pushed the group over the finish line
-            if quest.current_xp >= quest.target_xp:
-                quest.is_completed = True
-                
-                # --- Relic Logic Injection Point ---
-                # Example: find a specific relic, and grant it to all group_members 
-                # (You can build this out as you map specific quests to specific relics)
-                
-            db.add(quest)
+        db.add(quest)
             
+    # FIXED: Single atomic commit for all quest updates
     db.commit()

@@ -361,6 +361,11 @@ def refresh_access_token(
 
     The user's current token_version must match the
     refresh token's version.
+
+    A *refresh* token is required here — an access token
+    presented in its place must be rejected, otherwise a
+    short-lived access token could be used to extend a
+    session indefinitely.
     """
 
     try:
@@ -369,6 +374,24 @@ def refresh_access_token(
             SECRET_KEY,
             algorithms=[ALGORITHM],
         )
+
+        # ----------------------------------------------------
+        # TOKEN TYPE CHECK
+        # ----------------------------------------------------
+        #
+        # Tokens issued after this change carry a "type" claim
+        # ("access" or "refresh"). Tokens issued before this
+        # change have no "type" claim at all.
+        #
+        #   - If "type" is present, it MUST be "refresh".
+        #   - If "type" is absent, accept it for now so existing
+        #     sessions keep working; tighten to require "refresh"
+        #     once every issued token has the claim.
+        #
+        token_type = payload.get("type")
+
+        if token_type is not None and token_type != "refresh":
+            raise JWTError
 
         email = payload.get("sub")
         token_version = payload.get("version")
@@ -1005,11 +1028,3 @@ def google_login(
             ),
         },
     }
-
-
-# ============================================================
-# SERVER ERROR HELPER
-# ============================================================
-
-# No additional helper is needed here because errors are
-# returned directly through FastAPI HTTPException.
