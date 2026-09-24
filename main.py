@@ -104,6 +104,9 @@ from routers import (
 
 from routers.auth import limiter
 
+# NEW: Import the evolution math
+from utils import get_pet_evolution_data
+
 # ============================================================
 # LIFESPAN
 # ============================================================
@@ -629,29 +632,27 @@ def get_dashboard(
         )
     ).first()
 
-    if pet:
+    pet_type = pet.pet_type if pet else "nova"
+    pet_level = pet.level if pet else 1
+    pet_xp = pet.xp if pet else 0
+    pet_name = pet.pet_name if pet else "Nova"
+    pet_mood = getattr(pet, 'mood', "happy") if pet else "happy"
 
-        pet_info = PetDashboardInfo(
-            name=pet.pet_name,
-            type=pet.pet_type,
-            level=pet.level,
-            xp=pet.xp,
-            xp_to_next=1200,
-            mood="happy",
-            xp_history=real_xp_history,
-        )
+    # 1. Get the dynamic evolution data
+    evolution_data = get_pet_evolution_data(pet_type, pet_level, pet_xp)
 
-    else:
+    # 2. Combine base data with evolution data
+    pet_info_dict = {
+        "name": pet_name,
+        "type": pet_type,
+        "level": pet_level,
+        "xp": pet_xp,
+        "mood": pet_mood,
+        "xp_history": real_xp_history if pet else [0] * 7,
+        **evolution_data
+    }
 
-        pet_info = PetDashboardInfo(
-            name="Nova",
-            type="nova",
-            level=1,
-            xp=0,
-            xp_to_next=1200,
-            mood="happy",
-            xp_history=[0] * 7,
-        )
+    pet_info = PetDashboardInfo(**pet_info_dict)
 
     # --------------------------------------------------------
     # TODAY'S STUDY SESSIONS

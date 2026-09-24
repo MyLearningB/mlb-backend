@@ -78,6 +78,12 @@ class PetDashboardInfo(BaseModel):
     mood: str 
     xp_history: List[int]
     
+    # --- NEW SERVER-DRIVEN UI FIELDS ---
+    current_emoji: str
+    next_emoji: str
+    progress_percent: float
+    is_maxed: bool
+    
 class StreakInfo(BaseModel):
     days: int
     active_today: bool
@@ -116,7 +122,7 @@ class DashboardResponse(BaseModel):
 # ==========================================
 class PlanGoal(BaseModel):
     subject: str
-    deadline: Optional[date] = None # <-- Now Optional
+    deadline: Optional[date] = None
 
 class PlanStats(BaseModel):
     days_remaining: int
@@ -153,7 +159,7 @@ class PlanResponse(BaseModel):
 
 class PlanGenerateRequest(BaseModel):
     goal: str
-    deadline: Optional[date] = None # <-- Now Optional
+    deadline: Optional[date] = None 
 
 class SessionUpdateRequest(BaseModel):
     scheduled_time: Optional[str] = None

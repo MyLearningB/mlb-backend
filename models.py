@@ -134,7 +134,7 @@ class StudyPlan(SQLModel, table=True):
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE")
     
     subject: str
-    deadline: Optional[date] = None # <-- Now Optional
+    deadline: Optional[date] = None
     is_approved: bool = False
     
     user: Optional["User"] = Relationship(back_populates="study_plans")
@@ -360,11 +360,26 @@ class Notification(SQLModel, table=True):
     
     created_at: datetime = Field(default_factory=utc_now)
 
+# ==========================================
+# GAMIFICATION & TROPHIES (NEW DB DRIVEN)
+# ==========================================
+
+class TrophyDefinition(SQLModel, table=True):
+    id: str = Field(primary_key=True) # e.g., "streak_3", "collection_1"
+    title: str
+    description: str
+    icon: str
+    
+    # Engine Rules
+    condition_type: str # e.g., "streak", "collection", "feynman"
+    condition_value: int 
+    is_coop: bool = Field(default=False)
+
 class UserTrophy(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id", ondelete="CASCADE")
     
-    trophy_id: str 
+    trophy_id: str = Field(foreign_key="trophydefinition.id", ondelete="CASCADE")
     earned_at: datetime = Field(default_factory=utc_now)
 
 class Feedback(SQLModel, table=True):

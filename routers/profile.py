@@ -9,6 +9,9 @@ from database import get_session
 from security import get_current_user
 from models import User, Pet, DailyActivity, StudySession, Quest, Reminder, Flashcard, StudySet, Feedback
 
+# NEW: Import the evolution math
+from utils import get_pet_evolution_data
+
 router = APIRouter()
 
 # ─────────────────────────────────────────────────────────────
@@ -77,7 +80,6 @@ class FeedbackRequest(BaseModel):
 # 11.1 PROFILE ROOT ENDPOINTS
 # ─────────────────────────────────────────────────────────────
 
-# FIXED: Removed async for synchronous database operations
 @router.get("/profile", status_code=status.HTTP_200_OK)
 def get_profile(
     current_user: User = Depends(get_current_user), 
@@ -87,12 +89,24 @@ def get_profile(
     
     # 1. Pet Data
     pet = session.exec(select(Pet).where(Pet.user_id == current_user.id)).first()
+    
+    pet_type = pet.pet_type if pet else "nova"
+    pet_level = pet.level if pet else 1
+    pet_xp = pet.xp if pet else 0
+    pet_name = pet.pet_name if pet else "Nova"
+    pet_mood = getattr(pet, 'mood', "happy") if pet else "happy"
+    
     pet_data = {
-        "name": pet.pet_name if pet else "Nova",
-        "type": pet.pet_type if pet else "nova",
-        "level": pet.level if pet else 1,
-        "total_xp": pet.xp if pet else 0
+        "name": pet_name,
+        "type": pet_type,
+        "level": pet_level,
+        "xp": pet_xp,
+        "mood": pet_mood,
+        "xp_history": [0,0,0,0,0,0,0] 
     }
+    
+    # NEW: Merge the dynamic UI fields
+    pet_data.update(get_pet_evolution_data(pet_type, pet_level, pet_xp))
 
     # 2. Optimized Streak Data (O(1) lookup)
     today = datetime.now().date()
@@ -151,7 +165,6 @@ def get_profile(
         "recent_activity": recent_activity_list
     }
 
-# FIXED: Removed async and added support for study_goal
 @router.patch("/profile", status_code=status.HTTP_200_OK)
 def update_profile(
     data: ProfileUpdate, 
@@ -173,12 +186,9 @@ def update_profile(
         
     # FIXED: Check and update the study_goal if provided by the Quiz frontend
     if data.study_goal is not None:
-        # Assuming you have a 'study_goal' or similar field in your User model. 
-        # If your User model uses 'bio' to store this, change this to: current_user.bio = data.study_goal
         if hasattr(current_user, 'study_goal'):
             current_user.study_goal = data.study_goal
         else:
-            # Fallback if study_goal isn't an explicit column on your User table yet
             current_user.bio = data.study_goal
 
     session.add(current_user)
