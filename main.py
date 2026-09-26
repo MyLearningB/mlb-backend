@@ -13,7 +13,7 @@ from fastapi import (
     status,
     Depends,
     Header,
-    Request, # --- FIXED: Required for Rate Limiter ---
+    Request,  # --- FIXED: Required for Rate Limiter ---
 )
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
@@ -76,7 +76,7 @@ from schemas import (
     WeekDay,
     SessionDetail,
     OnboardingQuizSubmit,
-    ManualSessionCreate, # --- NEW: Added for manual session creation ---
+    ManualSessionCreate,  # --- NEW: Added for manual session creation ---
 )
 
 # ============================================================
@@ -266,37 +266,93 @@ def get_local_now(
 
 
 # ============================================================
-# ONBOARDING QUIZ 
+# ONBOARDING QUIZ
 # ============================================================
+
+ALLOWED_GOAL_TYPES = {
+    "university",
+    "professional",
+    "high_school",
+    "self_improvement",
+}
+
 
 @app.patch(
     "/users/me/quiz",
     status_code=status.HTTP_200_OK,
-    tags=["Profile"]
+    tags=["Profile"],
 )
 def submit_onboarding_quiz(
     request: OnboardingQuizSubmit,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
+    """
+    Save the user's onboarding quiz answer.
+
+    Frontend sends:
+
+        PATCH /users/me/quiz
+        { "goal_type": "university" }
+
+    study_goal and target_date are optional on the schema and
+    are only written when the client actually provides them.
+    """
+
+    # --------------------------------------------------------
+    # VALIDATE GOAL TYPE
+    # --------------------------------------------------------
+
+    if request.goal_type not in ALLOWED_GOAL_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid goal type.",
+        )
+
+    # --------------------------------------------------------
+    # ONBOARDING ALREADY FINISHED
+    # --------------------------------------------------------
+    #
+    # A user past onboarding shouldn't be able to rewrite their
+    # quiz answer through this endpoint. The Flutter client
+    # interprets 409 as "you're already done, go to dashboard."
+
+    if not current_user.is_first_session:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Onboarding already completed.",
+        )
+
+    # --------------------------------------------------------
+    # WRITE ONLY WHAT WAS SENT
+    # --------------------------------------------------------
+    #
+    # The current UI only collects goal_type. Don't clobber
+    # study_goal / target_date with None if the client didn't
+    # provide them — the plan generator reads those fields.
+
     current_user.goal_type = request.goal_type
-    current_user.study_goal = request.study_goal
-    current_user.target_date = request.target_date
-    
+
+    if request.study_goal is not None:
+        current_user.study_goal = request.study_goal
+
+    if request.target_date is not None:
+        current_user.target_date = request.target_date
+
     session.add(current_user)
-    
+
     try:
         session.commit()
     except Exception:
         session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not save quiz preferences."
+            detail="Could not save quiz preferences.",
         )
-        
+
     return {
         "message": "Study profile updated successfully",
-        "goal_type": current_user.goal_type
+        "goal_type": current_user.goal_type,
     }
 
 
@@ -469,7 +525,7 @@ def get_dashboard(
     # --- FIXED: Performance optimization for streak calculation ---
     # Only pull the last 60 days of activity to prevent database locking
     sixty_days_ago = (today - timedelta(days=60)).isoformat()
-    
+
     all_active_dates = session.exec(
         select(DailyActivity.date)
         .where(
@@ -722,10 +778,10 @@ def get_study_plan(
     response_model=PlanResponse,
     status_code=status.HTTP_200_OK,
 )
-@limiter.limit("5/minute") # --- FIXED: Rate limit added ---
+@limiter.limit("5/minute")  # --- FIXED: Rate limit added ---
 async def generate_study_plan(
-    http_request: Request, # --- FIXED: Required by limiter ---
-    payload: PlanGenerateRequest, 
+    http_request: Request,  # --- FIXED: Required by limiter ---
+    payload: PlanGenerateRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
@@ -795,7 +851,6 @@ async def generate_study_plan(
         )
 
         ai_session["completed"] = False
-
 
     return PlanResponse(
         goal=PlanGoal(
@@ -993,7 +1048,7 @@ def complete_session(
 
     # 4. Update Daily Activity (Powers the Streak)
     local_today = get_local_now(x_timezone).date().isoformat()
-    
+
     daily_activity = session.exec(
         select(DailyActivity).where(
             DailyActivity.user_id == current_user.id,
@@ -1014,7 +1069,7 @@ def complete_session(
     session.add(daily_activity)
 
     session.commit()
-    
+
     return {"message": "Session completed!", "xp_gained": xp_gained}
 
 
@@ -1069,9 +1124,9 @@ def approve_study_plan(
     response_model=SolveResponse,
     status_code=status.HTTP_200_OK,
 )
-@limiter.limit("5/minute") # --- FIXED: Rate limit added to protect AI usage ---
+@limiter.limit("5/minute")  # --- FIXED: Rate limit added to protect AI usage ---
 async def solve_question(
-    http_request: Request, # --- FIXED: Required by limiter ---
+    http_request: Request,  # --- FIXED: Required by limiter ---
     payload: SolveRequest,
     current_user: User = Depends(get_current_user),
 ):

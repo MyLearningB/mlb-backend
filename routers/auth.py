@@ -54,9 +54,22 @@ class GoogleLoginRequest(BaseModel):
 # ============================================================
 # RATE LIMITER
 # ============================================================
+#
+# Render / Fly / etc. put the client IP in X-Forwarded-For and
+# set request.client.host to the proxy address. Keying on the
+# proxy IP means every user shares one bucket — one abusive
+# client locks everyone out.
+
+def _rate_key(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # X-Forwarded-For can be "client, proxy1, proxy2" — take the first.
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
 
 limiter = Limiter(
-    key_func=get_remote_address
+    key_func=_rate_key
 )
 
 
@@ -347,59 +360,49 @@ def login_user(
 # ============================================================
 # REFRESH ACCESS TOKEN
 # ============================================================
+#
+# NOTE: We deliberately do NOT bump token_version here.
+#
+# Bumping on every refresh made only one device able to stay
+# logged in — the second device's next refresh would 401 and
+# get force-logged-out. It also caused parallel refreshes
+# (three 401s at once from the dashboard) to invalidate each
+# other.
+#
+# Revocation still works: logout, change-password, and
+# reset-password all bump token_version, which invalidates
+# every existing access AND refresh token for that user.
+#
+# Trade-off: refresh tokens are no longer strictly one-time
+# use. If you later want rotation with replay protection, add
+# a `previous_token_version` column and accept N-1 for a
+# short grace window.
 
 @router.post(
     "/token/refresh",
     response_model=TokenResponse,
 )
+@limiter.limit("20/minute")
 def refresh_access_token(
-    request: TokenRefreshRequest,
+    request: Request,
+    body: TokenRefreshRequest,
     session: Session = Depends(get_session),
 ):
-    """
-    Refresh an access token.
-
-    The user's current token_version must match the
-    refresh token's version.
-
-    A *refresh* token is required here — an access token
-    presented in its place must be rejected, otherwise a
-    short-lived access token could be used to extend a
-    session indefinitely.
-    """
-
     try:
         payload = jwt.decode(
-            request.refresh_token,
+            body.refresh_token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
         )
 
-        # ----------------------------------------------------
-        # TOKEN TYPE CHECK
-        # ----------------------------------------------------
-        #
-        # Tokens issued after this change carry a "type" claim
-        # ("access" or "refresh"). Tokens issued before this
-        # change have no "type" claim at all.
-        #
-        #   - If "type" is present, it MUST be "refresh".
-        #   - If "type" is absent, accept it for now so existing
-        #     sessions keep working; tighten to require "refresh"
-        #     once every issued token has the claim.
-        #
-        token_type = payload.get("type")
-
-        if token_type is not None and token_type != "refresh":
+        # Strict: only refresh tokens allowed here.
+        if payload.get("type") != "refresh":
             raise JWTError
 
         email = payload.get("sub")
         token_version = payload.get("version")
 
-        if (
-            email is None
-            or token_version is None
-        ):
+        if email is None or token_version is None:
             raise JWTError
 
     except JWTError:
@@ -408,14 +411,8 @@ def refresh_access_token(
             detail="Invalid token.",
         )
 
-    # --------------------------------------------------------
-    # FIND USER
-    # --------------------------------------------------------
-
     db_user = session.exec(
-        select(User).where(
-            User.email == email
-        )
+        select(User).where(User.email == email)
     ).first()
 
     if not db_user:
@@ -424,56 +421,35 @@ def refresh_access_token(
             detail="User not found.",
         )
 
-    # --------------------------------------------------------
-    # CHECK TOKEN VERSION
-    # --------------------------------------------------------
-
-    if (
-        db_user.token_version
-        != token_version
-    ):
+    if db_user.token_version != token_version:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=(
-                "Session expired. "
-                "Please log in again."
-            ),
+            detail="Session expired. Please log in again.",
         )
 
-    # --------------------------------------------------------
-    # CREATE NEW TOKENS
-    # --------------------------------------------------------
+    # ========================================================
+    # ISSUE NEW TOKENS WITH THE SAME VERSION
+    # ========================================================
 
     access_token = create_access_token(
-        data={
-            "sub": db_user.email
-        },
+        data={"sub": db_user.email},
         version=db_user.token_version,
     )
 
     refresh_token = create_refresh_token(
-        data={
-            "sub": db_user.email
-        },
+        data={"sub": db_user.email},
         version=db_user.token_version,
     )
-
-    # --------------------------------------------------------
-    # RESPONSE
-    # --------------------------------------------------------
 
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-
         "user": {
             "id": db_user.id,
             "email": db_user.email,
             "name": db_user.name,
-            "is_first_session": (
-                db_user.is_first_session
-            ),
+            "is_first_session": db_user.is_first_session,
         },
     }
 
@@ -587,21 +563,21 @@ def forgot_password(
     "/reset-password",
     status_code=status.HTTP_200_OK,
 )
+@limiter.limit("5/minute")
 def reset_password(
-    request: ResetPasswordRequest,
+    request: Request,
+    body: ResetPasswordRequest,
     session: Session = Depends(get_session),
 ):
     try:
         payload = jwt.decode(
-            request.token,
+            body.token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
         )
 
-        if (
-            payload.get("type")
-            != "password_reset"
-        ):
+        # Strict: only password-reset tokens.
+        if payload.get("type") != "password_reset":
             raise JWTError
 
         email = payload.get("sub")
@@ -631,7 +607,7 @@ def reset_password(
     # --------------------------------------------------------
 
     db_user.hashed_password = get_password_hash(
-        request.password
+        body.password
     )
 
     # --------------------------------------------------------
@@ -750,7 +726,11 @@ def logout(
     """
     Secure server-side logout.
 
-    Incrementing token_version invalidates existing tokens.
+    Incrementing token_version invalidates existing access
+    AND refresh tokens for this user.
+
+    The client is expected to call this before clearing its
+    local secure storage.
     """
 
     current_user.token_version += 1

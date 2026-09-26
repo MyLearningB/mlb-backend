@@ -55,6 +55,7 @@ def get_password_hash(password):
 #   version  — the user's token_version at issue time; used
 #              to revoke sessions server-side
 #   type     — "access" | "refresh" | "password_reset"
+#   iat      — issued-at, for logging/audit
 #   exp      — expiry
 #
 # The "type" claim is what allows each verifier to reject
@@ -65,12 +66,12 @@ def get_password_hash(password):
 
 
 def create_access_token(data: dict, version: int) -> str:
+    now = datetime.now(timezone.utc)
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+    expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({
         "exp": expire,
+        "iat": now,
         "version": version,
         "type": "access",
     })
@@ -78,12 +79,12 @@ def create_access_token(data: dict, version: int) -> str:
 
 
 def create_refresh_token(data: dict, version: int) -> str:
+    now = datetime.now(timezone.utc)
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
-        days=REFRESH_TOKEN_EXPIRE_DAYS
-    )
+    expire = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     to_encode.update({
         "exp": expire,
+        "iat": now,
         "version": version,
         "type": "refresh",
     })
@@ -91,11 +92,13 @@ def create_refresh_token(data: dict, version: int) -> str:
 
 
 def create_password_reset_token(email: str, version: int) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(hours=1)
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=1)
     to_encode = {
         "sub": email,
         "type": "password_reset",
         "version": version,
+        "iat": now,
         "exp": expire,
     }
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
@@ -127,16 +130,14 @@ def get_current_user(
         #
         # Protected endpoints must only accept access tokens.
         # A refresh token (7-day lifetime) presented here would
-        # otherwise be honoured as a valid credential and let a
-        # stolen refresh token authenticate API calls directly.
+        # otherwise be honoured as a valid credential.
         #
-        # Tokens issued before this change have no "type" claim,
-        # so we only reject when the claim is explicitly present
-        # and wrong. Once all live tokens carry the claim, tighten
-        # to require `token_type == "access"` unconditionally.
-        #
-        token_type = payload.get("type")
-        if token_type is not None and token_type != "access":
+        # This is now strict: any token without an explicit
+        # `type == "access"` claim is rejected. If you still
+        # have legacy tokens in the wild that predate the type
+        # claim, either let them expire (30 min) or add a
+        # migration window here.
+        if payload.get("type") != "access":
             raise credentials_exception
 
         email: str = payload.get("sub")

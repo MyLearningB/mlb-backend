@@ -33,8 +33,9 @@ def get_discover_collections(
     db: Session = Depends(get_session)
 ):
     query = select(Collection).where(
-        or_(Collection.visibility == "public", Collection.visibility == "private")
-    )
+    Collection.visibility == "public"
+)
+
 
     if search:
         query = query.where(
@@ -53,10 +54,11 @@ def get_discover_collections(
     collections = db.exec(query.offset(offset).limit(limit)).all()
     
     total_count = db.exec(
-        select(func.count(Collection.id)).where(
-            or_(Collection.visibility == "public", Collection.visibility == "private")
-        )
-    ).one()
+    select(func.count(Collection.id)).where(
+        Collection.visibility == "public"
+    )
+).one()
+
 
     return {
         "collections": collections,
