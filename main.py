@@ -13,7 +13,7 @@ from fastapi import (
     status,
     Depends,
     Header,
-    Request,  # --- FIXED: Required for Rate Limiter ---
+    Request,  # Required for slowapi rate limiting
 )
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
@@ -76,7 +76,7 @@ from schemas import (
     WeekDay,
     SessionDetail,
     OnboardingQuizSubmit,
-    ManualSessionCreate,  # --- NEW: Added for manual session creation ---
+    ManualSessionCreate,
 )
 
 # ============================================================
@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
 
     # --------------------------------------------------------
     # DATABASE
-    # --- FIXED NOTE: Transition to Alembic for migrations before v1.1 ---
+    # --- NOTE: Transition to Alembic for migrations before v1.1 ---
     # --------------------------------------------------------
 
     create_db_and_tables()
@@ -522,8 +522,7 @@ def get_dashboard(
         xp_map.get(today_str, 0) > 0
     )
 
-    # --- FIXED: Performance optimization for streak calculation ---
-    # Only pull the last 60 days of activity to prevent database locking
+    # --- Performance: only pull last 60 days for streak calc ---
     sixty_days_ago = (today - timedelta(days=60)).isoformat()
 
     all_active_dates = session.exec(
@@ -778,9 +777,9 @@ def get_study_plan(
     response_model=PlanResponse,
     status_code=status.HTTP_200_OK,
 )
-@limiter.limit("5/minute")  # --- FIXED: Rate limit added ---
+@limiter.limit("5/minute")
 async def generate_study_plan(
-    http_request: Request,  # --- FIXED: Required by limiter ---
+    request: Request,  # ← MUST be named `request` for slowapi
     payload: PlanGenerateRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
@@ -829,7 +828,7 @@ async def generate_study_plan(
         "sessions",
         [],
     ):
-        # --- FIXED: Safe fallback `.get()` prevents DeepSeek JSON KeyError crashes ---
+        # --- Safe fallback `.get()` prevents DeepSeek JSON KeyError crashes ---
         db_session = StudySession(
             plan_id=db_plan.id,
             user_id=current_user.id,
@@ -865,9 +864,8 @@ async def generate_study_plan(
 
 
 # ============================================================
-# CREATE MANUAL STUDY SESSION (NEW)
+# CREATE MANUAL STUDY SESSION
 # ============================================================
-# --- NEW: Allows users to add extra study sessions ---
 
 @app.post(
     "/users/me/plan/{plan_id}/session",
@@ -976,9 +974,8 @@ def update_session(
 
 
 # ============================================================
-# DELETE STUDY SESSION (NEW)
+# DELETE STUDY SESSION
 # ============================================================
-# --- NEW: Let users delete sessions ---
 
 @app.delete(
     "/users/me/plan/session/{session_id}",
@@ -1009,9 +1006,8 @@ def delete_session(
 
 
 # ============================================================
-# COMPLETE STUDY SESSION & GRANT XP (NEW)
+# COMPLETE STUDY SESSION & GRANT XP
 # ============================================================
-# --- NEW: Updates the streak and levels up the companion ---
 
 @app.post(
     "/users/me/plan/session/{session_id}/complete",
@@ -1124,9 +1120,9 @@ def approve_study_plan(
     response_model=SolveResponse,
     status_code=status.HTTP_200_OK,
 )
-@limiter.limit("5/minute")  # --- FIXED: Rate limit added to protect AI usage ---
+@limiter.limit("5/minute")
 async def solve_question(
-    http_request: Request,  # --- FIXED: Required by limiter ---
+    request: Request,  # ← MUST be named `request` for slowapi
     payload: SolveRequest,
     current_user: User = Depends(get_current_user),
 ):
