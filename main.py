@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional
 import json
@@ -13,12 +13,10 @@ from fastapi import (
     status,
     Depends,
     Header,
-    Request,  # Required for slowapi rate limiting
+    Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
-
-from sqlalchemy import text
 
 from slowapi.errors import RateLimitExceeded
 from slowapi import _rate_limit_exceeded_handler
@@ -64,19 +62,27 @@ from schemas import (
     PetDashboardInfo,
     StreakInfo,
     PlanResponse,
+    PlanGoal,
+    PlanStats,
     PlanGenerateRequest,
+    PlanUpdateRequest,
+    PlanArchiveRequest,
+    PlanListItem,
+    PlanListResponse,
     SessionUpdateRequest,
+    SessionDetail,
     PlanApproveRequest,
     SolveRequest,
     SolveResponse,
     SolveFeedbackRequest,
-    PlanGoal,
     TodayPlanSession,
-    PlanStats,
     WeekDay,
-    SessionDetail,
     OnboardingQuizSubmit,
+    StudyProfileUpdate,
     ManualSessionCreate,
+    # NEW: shared normalizers
+    normalize_mode,
+    normalize_priority,
 )
 
 # ============================================================
@@ -109,6 +115,29 @@ from utils import get_pet_evolution_data
 
 
 # ============================================================
+# CONSTANTS
+# ============================================================
+
+ALLOWED_GOAL_TYPES = {
+    "university",
+    "professional",
+    "high_school",
+    "self_improvement",
+}
+
+# Per-persona default emoji + accent colour.
+# Used when the client doesn't supply their own, so that
+# a uni student and a chess learner see visually different
+# chips on the dashboard.
+GOAL_TYPE_DEFAULTS = {
+    "university":        {"emoji": "🎓", "color_hex": "#7C6EE6"},
+    "professional":      {"emoji": "💼", "color_hex": "#3CFFC8"},
+    "high_school":       {"emoji": "📚", "color_hex": "#FF8A65"},
+    "self_improvement":  {"emoji": "✨", "color_hex": "#C8F53C"},
+}
+
+
+# ============================================================
 # LIFESPAN
 # ============================================================
 
@@ -126,48 +155,23 @@ async def lifespan(app: FastAPI):
     # FIREBASE
     # --------------------------------------------------------
 
-    firebase_json_str = os.getenv(
-        "FIREBASE_CREDENTIALS_JSON"
-    )
+    firebase_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
     try:
         if not firebase_admin._apps:
             if firebase_json_str:
-                cred_dict = json.loads(
-                    firebase_json_str
-                )
-                cred = credentials.Certificate(
-                    cred_dict
-                )
-                firebase_admin.initialize_app(
-                    cred
-                )
-                print(
-                    "🔥 Firebase initialized from "
-                    "FIREBASE_CREDENTIALS_JSON."
-                )
-            elif os.path.exists(
-                "firebase-credentials.json"
-            ):
-                cred = credentials.Certificate(
-                    "firebase-credentials.json"
-                )
-                firebase_admin.initialize_app(
-                    cred
-                )
-                print(
-                    "🔥 Firebase initialized from "
-                    "local credentials file."
-                )
+                cred_dict = json.loads(firebase_json_str)
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+                print("🔥 Firebase initialized from FIREBASE_CREDENTIALS_JSON.")
+            elif os.path.exists("firebase-credentials.json"):
+                cred = credentials.Certificate("firebase-credentials.json")
+                firebase_admin.initialize_app(cred)
+                print("🔥 Firebase initialized from local credentials file.")
             else:
-                print(
-                    "⚠️ Firebase credentials not found. "
-                    "Push notifications disabled."
-                )
+                print("⚠️ Firebase credentials not found. Push notifications disabled.")
     except Exception as e:
-        print(
-            f"❌ Error initializing Firebase: {e}"
-        )
+        print(f"❌ Error initializing Firebase: {e}")
 
     yield
 
@@ -188,11 +192,7 @@ app = FastAPI(
 # ============================================================
 
 app.state.limiter = limiter
-
-app.add_exception_handler(
-    RateLimitExceeded,
-    _rate_limit_exceeded_handler,
-)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ============================================================
@@ -241,23 +241,16 @@ app.include_router(
 # HEALTH CHECK
 # ============================================================
 
-@app.get(
-    "/ping",
-    tags=["Health"],
-)
+@app.get("/ping", tags=["Health"])
 def keep_alive():
-    return {
-        "status": "myLB is awake and ready for beta testing!"
-    }
+    return {"status": "myLB is awake and ready for beta testing!"}
 
 
 # ============================================================
 # TIMEZONE HELPER
 # ============================================================
 
-def get_local_now(
-    timezone_str: str = "UTC",
-) -> datetime:
+def get_local_now(timezone_str: str = "UTC") -> datetime:
     try:
         tz = ZoneInfo(timezone_str)
     except ZoneInfoNotFoundError:
@@ -266,16 +259,93 @@ def get_local_now(
 
 
 # ============================================================
-# ONBOARDING QUIZ
+# INTERNAL HELPERS
 # ============================================================
 
-ALLOWED_GOAL_TYPES = {
-    "university",
-    "professional",
-    "high_school",
-    "self_improvement",
-}
+def _persona_defaults(goal_type: Optional[str]) -> dict:
+    """Return the default emoji / color_hex for a goal_type."""
+    return GOAL_TYPE_DEFAULTS.get(
+        goal_type or "",
+        {"emoji": "🎯", "color_hex": "#7C6EE6"},
+    )
 
+
+def _build_plan_response(
+    db_plan: StudyPlan,
+    db_sessions: list,
+    local_today: date,
+) -> PlanResponse:
+    """Shared PlanResponse builder used by GET /plan and GET /plan/{id}."""
+    if db_plan.deadline:
+        days_remaining = max((db_plan.deadline - local_today).days, 0)
+    else:
+        days_remaining = -1
+
+    total_duration = sum(s.duration_mins for s in db_sessions)
+    daily_target = (
+        total_duration // len(db_sessions)
+        if db_sessions
+        else 60
+    )
+
+    stats = PlanStats(
+        days_remaining=days_remaining,
+        daily_target_mins=daily_target,
+        topics_count=len(db_sessions),
+    )
+
+    week = []
+    for i in range(7):
+        current_date = local_today + timedelta(days=i)
+        date_str = current_date.isoformat()
+        day_session = next(
+            (s for s in db_sessions if s.date == date_str),
+            None,
+        )
+        week.append(
+            WeekDay(
+                date=date_str,
+                day_label=current_date.strftime("%a").upper(),
+                has_session=bool(day_session),
+                session_type="study" if day_session else "rest",
+            )
+        )
+
+    formatted_sessions = [
+        SessionDetail(
+            id=str(s.id),
+            date=s.date,
+            time=s.time or "16:00",
+            subject=s.subject,
+            duration_mins=s.duration_mins,
+            mode=normalize_mode(s.mode),
+            priority=normalize_priority(s.priority),
+            completed=s.completed,
+        )
+        for s in db_sessions
+    ]
+
+    return PlanResponse(
+        plan_id=db_plan.id,
+        title=db_plan.title or db_plan.subject,
+        goal_type=db_plan.goal_type or "self_improvement",
+        emoji=db_plan.emoji,
+        color_hex=db_plan.color_hex,
+        is_approved=db_plan.is_approved,
+        goal=PlanGoal(
+            subject=db_plan.subject,
+            deadline=db_plan.deadline,
+        ),
+        stats=stats,
+        week=week,
+        sessions=formatted_sessions,
+        nudge=None,
+    )
+
+
+# ============================================================
+# ONBOARDING QUIZ (first-session only)
+# ============================================================
 
 @app.patch(
     "/users/me/quiz",
@@ -288,48 +358,21 @@ def submit_onboarding_quiz(
     session: Session = Depends(get_session),
 ):
     """
-    Save the user's onboarding quiz answer.
-
-    Frontend sends:
-
-        PATCH /users/me/quiz
-        { "goal_type": "university" }
-
-    study_goal and target_date are optional on the schema and
-    are only written when the client actually provides them.
+    Save the user's onboarding quiz answer. Only allowed once
+    (guarded by is_first_session). For later edits, use
+    PATCH /users/me/study-profile.
     """
-
-    # --------------------------------------------------------
-    # VALIDATE GOAL TYPE
-    # --------------------------------------------------------
-
     if request.goal_type not in ALLOWED_GOAL_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid goal type.",
         )
 
-    # --------------------------------------------------------
-    # ONBOARDING ALREADY FINISHED
-    # --------------------------------------------------------
-    #
-    # A user past onboarding shouldn't be able to rewrite their
-    # quiz answer through this endpoint. The Flutter client
-    # interprets 409 as "you're already done, go to dashboard."
-
     if not current_user.is_first_session:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Onboarding already completed.",
         )
-
-    # --------------------------------------------------------
-    # WRITE ONLY WHAT WAS SENT
-    # --------------------------------------------------------
-    #
-    # The current UI only collects goal_type. Don't clobber
-    # study_goal / target_date with None if the client didn't
-    # provide them — the plan generator reads those fields.
 
     current_user.goal_type = request.goal_type
 
@@ -340,7 +383,6 @@ def submit_onboarding_quiz(
         current_user.target_date = request.target_date
 
     session.add(current_user)
-
     try:
         session.commit()
     except Exception:
@@ -357,6 +399,56 @@ def submit_onboarding_quiz(
 
 
 # ============================================================
+# STUDY PROFILE (always available)
+# ============================================================
+#
+# NEW. This is the endpoint the client should call when a user
+# wants to change their default persona AFTER onboarding. It is
+# intentionally NOT gated by is_first_session.
+
+@app.patch(
+    "/users/me/study-profile",
+    status_code=status.HTTP_200_OK,
+    tags=["Profile"],
+)
+def update_study_profile(
+    request: StudyProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    if request.goal_type is not None:
+        if request.goal_type not in ALLOWED_GOAL_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid goal type.",
+            )
+        current_user.goal_type = request.goal_type
+
+    if request.study_goal is not None:
+        current_user.study_goal = request.study_goal
+
+    if request.target_date is not None:
+        current_user.target_date = request.target_date
+
+    session.add(current_user)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not update study profile.",
+        )
+
+    return {
+        "message": "Study profile updated.",
+        "goal_type": current_user.goal_type,
+        "study_goal": current_user.study_goal,
+        "target_date": current_user.target_date,
+    }
+
+
+# ============================================================
 # PET ADOPTION
 # ============================================================
 
@@ -369,7 +461,6 @@ def adopt_pet(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-
     if not current_user.id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -390,12 +481,7 @@ def adopt_pet(
             detail="Pet name cannot exceed 20 characters.",
         )
 
-    allowed_pet_types = {
-        "nova",
-        "pip",
-        "luna",
-        "zap",
-    }
+    allowed_pet_types = {"nova", "pip", "luna", "zap"}
 
     if pet_data.pet_type not in allowed_pet_types:
         raise HTTPException(
@@ -404,9 +490,7 @@ def adopt_pet(
         )
 
     existing_pet = session.exec(
-        select(Pet).where(
-            Pet.user_id == current_user.id
-        )
+        select(Pet).where(Pet.user_id == current_user.id)
     ).first()
 
     if existing_pet:
@@ -467,10 +551,7 @@ def get_dashboard(
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
-    local_now = get_local_now(
-        x_timezone
-    )
-
+    local_now = get_local_now(x_timezone)
     hour = local_now.hour
 
     if hour < 12:
@@ -495,9 +576,7 @@ def get_dashboard(
     today_str = today.isoformat()
 
     last_7_days = [
-        (
-            today - timedelta(days=i)
-        ).isoformat()
+        (today - timedelta(days=i)).isoformat()
         for i in range(6, -1, -1)
     ]
 
@@ -508,21 +587,12 @@ def get_dashboard(
         )
     ).all()
 
-    xp_map = {
-        activity.date: activity.xp_earned
-        for activity in activities
-    }
+    xp_map = {a.date: a.xp_earned for a in activities}
 
-    real_xp_history = [
-        xp_map.get(day, 0)
-        for day in last_7_days
-    ]
+    real_xp_history = [xp_map.get(day, 0) for day in last_7_days]
 
-    streak_active = (
-        xp_map.get(today_str, 0) > 0
-    )
+    streak_active = xp_map.get(today_str, 0) > 0
 
-    # --- Performance: only pull last 60 days for streak calc ---
     sixty_days_ago = (today - timedelta(days=60)).isoformat()
 
     all_active_dates = session.exec(
@@ -530,12 +600,10 @@ def get_dashboard(
         .where(
             DailyActivity.user_id == current_user.id,
             DailyActivity.xp_earned > 0,
-            DailyActivity.date >= sixty_days_ago
+            DailyActivity.date >= sixty_days_ago,
         )
         .distinct()
-        .order_by(
-            DailyActivity.date.desc()
-        )
+        .order_by(DailyActivity.date.desc())
     ).all()
 
     streak_count = 0
@@ -559,16 +627,14 @@ def get_dashboard(
     )
 
     pet = session.exec(
-        select(Pet).where(
-            Pet.user_id == current_user.id
-        )
+        select(Pet).where(Pet.user_id == current_user.id)
     ).first()
 
     pet_type = pet.pet_type if pet else "nova"
     pet_level = pet.level if pet else 1
     pet_xp = pet.xp if pet else 0
     pet_name = pet.pet_name if pet else "Nova"
-    pet_mood = getattr(pet, 'mood', "happy") if pet else "happy"
+    pet_mood = getattr(pet, "mood", "happy") if pet else "happy"
 
     evolution_data = get_pet_evolution_data(pet_type, pet_level, pet_xp)
 
@@ -579,10 +645,26 @@ def get_dashboard(
         "xp": pet_xp,
         "mood": pet_mood,
         "xp_history": real_xp_history if pet else [0] * 7,
-        **evolution_data
+        **evolution_data,
     }
 
     pet_info = PetDashboardInfo(**pet_info_dict)
+
+    # ------------------------------------------------
+    # Today's sessions (excludes archived plans)
+    # ------------------------------------------------
+    # NEW: join StudyPlan to skip archived plans and pull
+    # emoji / color_hex / plan_id for the chip UI.
+
+    plans_by_id = {
+        p.id: p
+        for p in session.exec(
+            select(StudyPlan).where(
+                StudyPlan.user_id == current_user.id,
+                StudyPlan.is_archived == False,
+            )
+        ).all()
+    }
 
     today_sessions = session.exec(
         select(StudySession)
@@ -591,40 +673,43 @@ def get_dashboard(
             StudySession.date == today_str,
             StudySession.completed == False,
         )
-        .order_by(
-            StudySession.id
-        )
-        .limit(4)
+        .order_by(StudySession.id)
     ).all()
 
-    real_today_plan = [
-        TodayPlanSession(
-            id=str(study_session.id),
-            subject=study_session.subject,
-            duration_mins=study_session.duration_mins,
-            mode=study_session.mode,
+    real_today_plan = []
+    for s in today_sessions:
+        plan = plans_by_id.get(s.plan_id)
+        if plan is None:
+            # session belongs to an archived/deleted plan → skip
+            continue
+        real_today_plan.append(
+            TodayPlanSession(
+                id=str(s.id),
+                plan_id=plan.id,
+                subject=s.subject,
+                duration_mins=s.duration_mins,
+                mode=normalize_mode(s.mode),
+                emoji=plan.emoji,
+                color_hex=plan.color_hex,
+            )
         )
-        for study_session in today_sessions
-    ]
+        if len(real_today_plan) >= 8:
+            break
 
     db_quests = session.exec(
-        select(Quest)
-        .where(
-            Quest.user_id == current_user.id
-        )
-        .limit(3)
+        select(Quest).where(Quest.user_id == current_user.id).limit(3)
     ).all()
 
     real_quests = [
         {
-            "id": str(quest.id),
-            "title": quest.title,
-            "type": quest.type,
-            "progress": quest.progress,
-            "target": quest.target,
-            "members_count": quest.members_count,
+            "id": str(q.id),
+            "title": q.title,
+            "type": q.type,
+            "progress": q.progress,
+            "target": q.target,
+            "members_count": q.members_count,
         }
-        for quest in db_quests
+        for q in db_quests
     ]
 
     return DashboardResponse(
@@ -641,7 +726,66 @@ def get_dashboard(
 
 
 # ============================================================
-# GET STUDY PLAN
+# LIST ALL PLANS (multi-goal switcher)
+# ============================================================
+
+@app.get(
+    "/users/me/plans",
+    response_model=PlanListResponse,
+    status_code=status.HTTP_200_OK,
+)
+def list_study_plans(
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+    include_archived: bool = False,
+):
+    today = get_local_now(x_timezone).date()
+
+    query = select(StudyPlan).where(StudyPlan.user_id == current_user.id)
+
+    if not include_archived:
+        query = query.where(StudyPlan.is_archived == False)
+
+    plans = session.exec(
+        query.order_by(StudyPlan.created_at.desc())
+    ).all()
+
+    items: list[PlanListItem] = []
+
+    for plan in plans:
+        sessions = session.exec(
+            select(StudySession).where(StudySession.plan_id == plan.id)
+        ).all()
+
+        completed_count = sum(1 for s in sessions if s.completed)
+
+        days_remaining = None
+        if plan.deadline:
+            days_remaining = max((plan.deadline - today).days, 0)
+
+        items.append(
+            PlanListItem(
+                plan_id=plan.id,
+                title=plan.title or plan.subject,
+                subject=plan.subject,
+                goal_type=plan.goal_type or "self_improvement",
+                deadline=plan.deadline,
+                emoji=plan.emoji,
+                color_hex=plan.color_hex,
+                is_approved=plan.is_approved,
+                is_archived=plan.is_archived,
+                days_remaining=days_remaining,
+                session_count=len(sessions),
+                completed_count=completed_count,
+            )
+        )
+
+    return PlanListResponse(plans=items, total_count=len(items))
+
+
+# ============================================================
+# GET LATEST PLAN (kept for Flutter compat)
 # ============================================================
 
 @app.get(
@@ -649,122 +793,70 @@ def get_dashboard(
     response_model=Optional[PlanResponse],
     status_code=status.HTTP_200_OK,
 )
-def get_study_plan(
+def get_latest_study_plan(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
-    statement = (
+    db_plan = session.exec(
         select(StudyPlan)
         .where(
-            StudyPlan.user_id == current_user.id
+            StudyPlan.user_id == current_user.id,
+            StudyPlan.is_archived == False,
         )
-        .order_by(
-            StudyPlan.id.desc()
-        )
-    )
-
-    db_plan = session.exec(
-        statement
+        .order_by(StudyPlan.id.desc())
     ).first()
 
     if not db_plan:
         return None
 
-    sessions_statement = (
-        select(StudySession)
-        .where(
-            StudySession.plan_id == db_plan.id
-        )
-    )
-
     db_sessions = session.exec(
-        sessions_statement
+        select(StudySession).where(StudySession.plan_id == db_plan.id)
     ).all()
 
-    today = get_local_now(
-        x_timezone
-    ).date()
-
-    if db_plan.deadline:
-        days_remaining = (db_plan.deadline - today).days
-        days_remaining = max(days_remaining, 0)
-    else:
-        days_remaining = -1
-
-    total_duration = sum(
-        study_session.duration_mins
-        for study_session in db_sessions
+    return _build_plan_response(
+        db_plan,
+        db_sessions,
+        get_local_now(x_timezone).date(),
     )
 
-    daily_target = (
-        total_duration // len(db_sessions)
-        if db_sessions
-        else 60
-    )
 
-    stats = PlanStats(
-        days_remaining=days_remaining,
-        daily_target_mins=daily_target,
-        topics_count=len(db_sessions),
-    )
+# ============================================================
+# GET PLAN BY ID
+# ============================================================
 
-    week = []
+@app.get(
+    "/users/me/plan/{plan_id}",
+    response_model=PlanResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_study_plan_by_id(
+    plan_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+):
+    db_plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == current_user.id,
+        )
+    ).first()
 
-    for i in range(7):
-        current_date = (
-            today + timedelta(days=i)
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Study plan not found.",
         )
 
-        date_str = current_date.isoformat()
+    db_sessions = session.exec(
+        select(StudySession).where(StudySession.plan_id == db_plan.id)
+    ).all()
 
-        day_session = next(
-            (
-                study_session
-                for study_session in db_sessions
-                if study_session.date == date_str
-            ),
-            None,
-        )
-
-        week.append(
-            WeekDay(
-                date=date_str,
-                day_label=current_date.strftime(
-                    "%a"
-                ).upper(),
-                has_session=bool(day_session),
-                session_type=(
-                    "study"
-                    if day_session
-                    else "rest"
-                ),
-            )
-        )
-
-    formatted_sessions = [
-        SessionDetail(
-            id=str(study_session.id),
-            date=study_session.date,
-            time=study_session.time or "16:00",
-            subject=study_session.subject,
-            duration_mins=study_session.duration_mins,
-            mode=study_session.mode,
-            priority=study_session.priority,
-            completed=study_session.completed,
-        )
-        for study_session in db_sessions
-    ]
-
-    return PlanResponse(
-        goal=PlanGoal(
-            subject=db_plan.subject,
-            deadline=db_plan.deadline,
-        ),
-        stats=stats,
-        week=week,
-        sessions=formatted_sessions,
-        nudge=None,
+    return _build_plan_response(
+        db_plan,
+        db_sessions,
+        get_local_now(x_timezone).date(),
     )
 
 
@@ -779,18 +871,15 @@ def get_study_plan(
 )
 @limiter.limit("5/minute")
 async def generate_study_plan(
-    request: Request,  # ← MUST be named `request` for slowapi
+    request: Request,
     payload: PlanGenerateRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
-    today = get_local_now(
-        x_timezone
-    ).date()
+    today = get_local_now(x_timezone).date()
 
     days_remaining = None
-
     if payload.deadline:
         days_remaining = (payload.deadline - today).days
         if days_remaining < 0:
@@ -799,12 +888,33 @@ async def generate_study_plan(
                 detail="Deadline passed.",
             )
 
-    ai_plan_data = (
-        await generate_deepseek_study_plan(
-            goal=payload.goal,
-            target_date=payload.deadline,
-            days_remaining=days_remaining,
-        )
+    # --------------------------------------------------------
+    # PERSONA RESOLUTION
+    # --------------------------------------------------------
+    # Prefer the request's goal_type (per-plan persona);
+    # fall back to the user's onboarding choice.
+    resolved_goal_type = (
+        payload.goal_type
+        or current_user.goal_type
+        or "self_improvement"
+    )
+
+    if resolved_goal_type not in ALLOWED_GOAL_TYPES:
+        resolved_goal_type = "self_improvement"
+
+    defaults = _persona_defaults(resolved_goal_type)
+
+    # --------------------------------------------------------
+    # AI GENERATION (persona-aware)
+    # --------------------------------------------------------
+    # ai_service.generate_deepseek_study_plan must accept
+    # `goal_type` and inject the persona hint into the prompt.
+    # See the "ai_service.py" note below this file.
+    ai_plan_data = await generate_deepseek_study_plan(
+        goal=payload.goal,
+        target_date=payload.deadline,
+        days_remaining=days_remaining,
+        goal_type=resolved_goal_type,
     )
 
     if not ai_plan_data:
@@ -813,10 +923,18 @@ async def generate_study_plan(
             detail="Failed to generate plan.",
         )
 
+    # --------------------------------------------------------
+    # PERSIST PLAN
+    # --------------------------------------------------------
+
     db_plan = StudyPlan(
         user_id=current_user.id,
+        title=payload.title or payload.goal,
         subject=payload.goal,
+        goal_type=resolved_goal_type,
         deadline=payload.deadline,
+        emoji=payload.emoji or defaults["emoji"],
+        color_hex=payload.color_hex or defaults["color_hex"],
         is_approved=False,
     )
 
@@ -824,11 +942,13 @@ async def generate_study_plan(
     session.commit()
     session.refresh(db_plan)
 
-    for ai_session in ai_plan_data.get(
-        "sessions",
-        [],
-    ):
-        # --- Safe fallback `.get()` prevents DeepSeek JSON KeyError crashes ---
+    # --------------------------------------------------------
+    # PERSIST SESSIONS
+    # --------------------------------------------------------
+
+    formatted_sessions: list[SessionDetail] = []
+
+    for ai_session in ai_plan_data.get("sessions", []):
         db_session = StudySession(
             plan_id=db_plan.id,
             user_id=current_user.id,
@@ -836,8 +956,10 @@ async def generate_study_plan(
             time=ai_session.get("time", "12:00"),
             subject=ai_session.get("subject", payload.goal),
             duration_mins=ai_session.get("duration_mins", 30),
-            mode=ai_session.get("mode", "Review"),
-            priority=ai_session.get("priority", "Medium"),
+            # FIX: normalize AI output so DB never stores
+            # "Review"/"Medium" variants that break the Literal.
+            mode=normalize_mode(ai_session.get("mode", "review")),
+            priority=normalize_priority(ai_session.get("priority", "normal")),
             completed=False,
         )
 
@@ -845,22 +967,203 @@ async def generate_study_plan(
         session.commit()
         session.refresh(db_session)
 
-        ai_session["id"] = str(
-            db_session.id
+        formatted_sessions.append(
+            SessionDetail(
+                id=str(db_session.id),
+                date=db_session.date,
+                time=db_session.time,
+                subject=db_session.subject,
+                duration_mins=db_session.duration_mins,
+                mode=db_session.mode,
+                priority=db_session.priority,
+                completed=False,
+            )
         )
 
-        ai_session["completed"] = False
-
-    return PlanResponse(
-        goal=PlanGoal(
-            subject=payload.goal,
-            deadline=payload.deadline,
-        ),
-        stats=ai_plan_data.get("stats", {}),
-        week=ai_plan_data.get("week", []),
-        sessions=ai_plan_data.get("sessions", []),
-        nudge=None,
+    # Rebuild the whole response from the DB so we return exactly
+    # what a subsequent GET would return — no AI-shape leakage.
+    return _build_plan_response(
+        db_plan,
+        session.exec(
+            select(StudySession).where(StudySession.plan_id == db_plan.id)
+        ).all(),
+        today,
     )
+
+
+# ============================================================
+# UPDATE PLAN METADATA
+# ============================================================
+
+@app.patch(
+    "/users/me/plan/{plan_id}",
+    status_code=status.HTTP_200_OK,
+)
+def update_plan_metadata(
+    plan_id: int,
+    payload: PlanUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    db_plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == current_user.id,
+        )
+    ).first()
+
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Plan not found.",
+        )
+
+    if payload.title is not None:
+        db_plan.title = payload.title
+    if payload.deadline is not None:
+        db_plan.deadline = payload.deadline
+    if payload.emoji is not None:
+        db_plan.emoji = payload.emoji
+    if payload.color_hex is not None:
+        db_plan.color_hex = payload.color_hex
+    if payload.goal_type is not None:
+        if payload.goal_type not in ALLOWED_GOAL_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid goal type.",
+            )
+        db_plan.goal_type = payload.goal_type
+
+    session.add(db_plan)
+    session.commit()
+    session.refresh(db_plan)
+
+    return {
+        "message": "Plan updated.",
+        "plan_id": db_plan.id,
+        "title": db_plan.title,
+    }
+
+
+# ============================================================
+# ARCHIVE / UNARCHIVE PLAN
+# ============================================================
+
+@app.post(
+    "/users/me/plan/{plan_id}/archive",
+    status_code=status.HTTP_200_OK,
+)
+def archive_plan(
+    plan_id: int,
+    payload: PlanArchiveRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    db_plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == current_user.id,
+        )
+    ).first()
+
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Plan not found.",
+        )
+
+    db_plan.is_archived = payload.archived
+    session.add(db_plan)
+    session.commit()
+
+    return {
+        "message": "Plan archived." if payload.archived else "Plan restored.",
+        "plan_id": db_plan.id,
+        "is_archived": db_plan.is_archived,
+    }
+
+
+# ============================================================
+# APPROVE PLAN — legacy route (Flutter currently hits this)
+# ============================================================
+#
+# Flutter sends PATCH /users/me/plan { approved: true }.
+# We approve the user's latest non-archived plan.
+# Once Flutter switches to /plan/{plan_id}/approve, this stays
+# around as a backwards-compatible convenience.
+
+@app.patch(
+    "/users/me/plan",
+    status_code=status.HTTP_200_OK,
+)
+def approve_latest_plan_legacy(
+    request: PlanApproveRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    db_plan = session.exec(
+        select(StudyPlan)
+        .where(
+            StudyPlan.user_id == current_user.id,
+            StudyPlan.is_archived == False,
+        )
+        .order_by(StudyPlan.id.desc())
+    ).first()
+
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No plan to approve.",
+        )
+
+    db_plan.is_approved = request.approved
+    session.add(db_plan)
+    session.commit()
+    session.refresh(db_plan)
+
+    return {
+        "message": f"Plan {db_plan.id} approved status updated",
+        "approved": db_plan.is_approved,
+        "plan_id": db_plan.id,
+    }
+
+
+# ============================================================
+# APPROVE PLAN — canonical per-plan route
+# ============================================================
+
+@app.patch(
+    "/users/me/plan/{plan_id}/approve",
+    status_code=status.HTTP_200_OK,
+)
+def approve_study_plan(
+    plan_id: int,
+    request: PlanApproveRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    db_plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == current_user.id,
+        )
+    ).first()
+
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Plan not found.",
+        )
+
+    db_plan.is_approved = request.approved
+    session.add(db_plan)
+    session.commit()
+    session.refresh(db_plan)
+
+    return {
+        "message": f"Plan {plan_id} approved status updated",
+        "approved": db_plan.is_approved,
+    }
 
 
 # ============================================================
@@ -880,7 +1183,7 @@ def add_manual_session(
     db_plan = session.exec(
         select(StudyPlan).where(
             StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id
+            StudyPlan.user_id == current_user.id,
         )
     ).first()
 
@@ -897,8 +1200,8 @@ def add_manual_session(
         time=payload.time,
         subject=payload.subject,
         duration_mins=payload.duration_mins,
-        mode=payload.mode,
-        priority=payload.priority,
+        mode=normalize_mode(payload.mode),
+        priority=normalize_priority(payload.priority),
         completed=False,
     )
 
@@ -913,8 +1216,8 @@ def add_manual_session(
             "date": new_session.date,
             "subject": new_session.subject,
             "duration_mins": new_session.duration_mins,
-            "mode": new_session.mode
-        }
+            "mode": new_session.mode,
+        },
     }
 
 
@@ -932,7 +1235,6 @@ def update_session(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-
     db_session = session.exec(
         select(StudySession).where(
             StudySession.id == session_id,
@@ -947,9 +1249,7 @@ def update_session(
         )
 
     if request.scheduled_time is not None:
-        db_session.time = (
-            request.scheduled_time
-        )
+        db_session.time = request.scheduled_time
 
     if request.duration_mins is not None:
         if request.duration_mins <= 0:
@@ -957,14 +1257,10 @@ def update_session(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Duration must be greater than zero.",
             )
-        db_session.duration_mins = (
-            request.duration_mins
-        )
+        db_session.duration_mins = request.duration_mins
 
     if request.skipped is not None:
-        db_session.skipped = (
-            request.skipped
-        )
+        db_session.skipped = request.skipped
 
     session.add(db_session)
     session.commit()
@@ -989,7 +1285,7 @@ def delete_session(
     db_session = session.exec(
         select(StudySession).where(
             StudySession.id == session_id,
-            StudySession.user_id == current_user.id
+            StudySession.user_id == current_user.id,
         )
     ).first()
 
@@ -1022,33 +1318,39 @@ def complete_session(
     db_session = session.exec(
         select(StudySession).where(
             StudySession.id == session_id,
-            StudySession.user_id == current_user.id
+            StudySession.user_id == current_user.id,
         )
     ).first()
 
     if not db_session or db_session.completed:
-        raise HTTPException(status_code=400, detail="Session invalid or already completed.")
+        raise HTTPException(
+            status_code=400,
+            detail="Session invalid or already completed.",
+        )
 
     # 1. Mark complete
     db_session.completed = True
     session.add(db_session)
 
-    # 2. Grant XP Based on Duration
+    # 2. Grant XP based on duration
     xp_gained = db_session.duration_mins
 
     # 3. Add to Pet
-    pet = session.exec(select(Pet).where(Pet.user_id == current_user.id)).first()
+    pet = session.exec(
+        select(Pet).where(Pet.user_id == current_user.id)
+    ).first()
+
     if pet:
         pet.xp += xp_gained
         session.add(pet)
 
-    # 4. Update Daily Activity (Powers the Streak)
+    # 4. Update Daily Activity (powers the Streak)
     local_today = get_local_now(x_timezone).date().isoformat()
 
     daily_activity = session.exec(
         select(DailyActivity).where(
             DailyActivity.user_id == current_user.id,
-            DailyActivity.date == local_today
+            DailyActivity.date == local_today,
         )
     ).first()
 
@@ -1060,55 +1362,13 @@ def complete_session(
             user_id=current_user.id,
             date=local_today,
             xp_earned=xp_gained,
-            study_time_mins=db_session.duration_mins
+            study_time_mins=db_session.duration_mins,
         )
     session.add(daily_activity)
 
     session.commit()
 
     return {"message": "Session completed!", "xp_gained": xp_gained}
-
-
-# ============================================================
-# APPROVE STUDY PLAN
-# ============================================================
-
-@app.patch(
-    "/users/me/plan/{plan_id}/approve",
-    status_code=status.HTTP_200_OK,
-)
-def approve_study_plan(
-    plan_id: int,
-    request: PlanApproveRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-
-    db_plan.is_approved = request.approved
-
-    session.add(db_plan)
-    session.commit()
-    session.refresh(db_plan)
-
-    return {
-        "message": (
-            f"Plan {plan_id} "
-            f"approved status updated"
-        ),
-        "approved": db_plan.is_approved,
-    }
 
 
 # ============================================================
@@ -1120,24 +1380,19 @@ def approve_study_plan(
     response_model=SolveResponse,
     status_code=status.HTTP_200_OK,
 )
-@limiter.limit("5/minute")
+@limiter.limit("15/minute")
 async def solve_question(
-    request: Request,  # ← MUST be named `request` for slowapi
+    request: Request,
     payload: SolveRequest,
     current_user: User = Depends(get_current_user),
 ):
-
     if not payload.question_text:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Please provide a question_text.",
         )
 
-    solution_data = (
-        await generate_deepseek_solution(
-            payload.question_text
-        )
-    )
+    solution_data = await generate_deepseek_solution(payload.question_text)
 
     if not solution_data:
         raise HTTPException(
@@ -1145,9 +1400,7 @@ async def solve_question(
             detail="Couldn't generate a solution. Try again.",
         )
 
-    return SolveResponse(
-        **solution_data
-    )
+    return SolveResponse(**solution_data)
 
 
 # ============================================================
@@ -1180,6 +1433,4 @@ def submit_solution_feedback(
         f"Reason: {request.flag_reason}"
     )
 
-    return {
-        "acknowledged": True
-    }
+    return {"acknowledged": True}

@@ -120,6 +120,8 @@ class User(SQLModel, table=True):
 
     study_goal: Optional[str] = None
 
+    # NOTE: `goal_type` on User is the DEFAULT persona for newly
+    # generated plans. Per-plan personas live on StudyPlan.goal_type.
     goal_type: Optional[str] = None
 
     target_date: Optional[date] = None
@@ -387,13 +389,31 @@ class StudyPlan(SQLModel, table=True):
         index=True,
     )
 
+    # --------------------------------------
+    # NEW: per-plan metadata
+    # --------------------------------------
+    # `title` is a user-facing label ("IELTS Academic"),
+    # `subject` stays as the AI-facing subject string.
+    # `goal_type` is the persona for THIS plan (may differ
+    # from User.goal_type — a uni student learning chess).
+    title: str = Field(default="My Plan", max_length=80)
+
     subject: str
+
+    goal_type: str = Field(default="self_improvement")
 
     deadline: Optional[date] = None
 
-    is_approved: bool = Field(
-        default=False,
-    )
+    emoji: Optional[str] = Field(default=None, max_length=10)
+
+    color_hex: Optional[str] = Field(default=None, max_length=9)
+
+    is_approved: bool = Field(default=False)
+
+    # Soft delete so we never blow away session history.
+    is_archived: bool = Field(default=False, index=True)
+
+    created_at: datetime = Field(default_factory=utc_now)
 
     user: Optional["User"] = Relationship(
         back_populates="study_plans",
@@ -454,6 +474,10 @@ class StudySession(SQLModel, table=True):
     )
 
 
+# ==========================================
+# DAILY ACTIVITY
+# ==========================================
+
 class DailyActivity(SQLModel, table=True):
     id: Optional[int] = Field(
         default=None,
@@ -469,6 +493,14 @@ class DailyActivity(SQLModel, table=True):
     date: str
 
     xp_earned: int = Field(
+        default=0,
+        ge=0,
+    )
+
+    # NEW: main.py's complete_session() was writing to this
+    # field, but it wasn't declared — first session completion
+    # would raise AttributeError.
+    study_time_mins: int = Field(
         default=0,
         ge=0,
     )
