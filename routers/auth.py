@@ -122,8 +122,13 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+# Logout is identified by the access token (via get_current_user),
+# and the resulting token_version bump revokes BOTH the access and
+# refresh tokens. The refresh_token field was unused, so it's gone.
+# Old clients that still send {"refresh_token": "..."} are fine —
+# FastAPI silently ignores unknown body fields.
 class LogoutRequest(BaseModel):
-    refresh_token: str
+    pass
 
 
 # ============================================================
@@ -715,7 +720,6 @@ def change_password(
     status_code=status.HTTP_200_OK,
 )
 def logout(
-    request: LogoutRequest,
     current_user: User = Depends(
         get_current_user
     ),

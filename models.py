@@ -164,6 +164,11 @@ class User(SQLModel, table=True):
     # --------------------------------------
     # STREAKS
     # --------------------------------------
+    #
+    # These are kept in sync by complete_session() in main.py.
+    # They power /users/me/profile's streak display. The dashboard
+    # computes streak independently from DailyActivity rows — both
+    # must agree, so complete_session updates both in one commit.
 
     current_streak: int = Field(
         default=0,
@@ -390,7 +395,7 @@ class StudyPlan(SQLModel, table=True):
     )
 
     # --------------------------------------
-    # NEW: per-plan metadata
+    # Per-plan metadata
     # --------------------------------------
     # `title` is a user-facing label ("IELTS Academic"),
     # `subject` stays as the AI-facing subject string.
@@ -497,9 +502,6 @@ class DailyActivity(SQLModel, table=True):
         ge=0,
     )
 
-    # NEW: main.py's complete_session() was writing to this
-    # field, but it wasn't declared — first session completion
-    # would raise AttributeError.
     study_time_mins: int = Field(
         default=0,
         ge=0,
@@ -1197,6 +1199,27 @@ class UserTrophy(SQLModel, table=True):
     )
 
 
+# ==========================================
+# FEEDBACK
+# ==========================================
+#
+# Two different flows write to this table:
+#
+#   1. Generic app feedback  → POST /users/me/feedback
+#      Sets: user_id, message
+#
+#   2. AI solution feedback  → POST /solve/{id}/feedback
+#      Sets: user_id, solution_id, helpful, flag_reason
+#
+# Historically only `message` existed, which made every call to
+# the AI-solution-feedback endpoint crash with an AttributeError
+# at commit time (the model silently accepted the extra kwargs
+# as transient Python attrs and then SQLAlchemy choked).
+#
+# Both shapes are now supported with all fields optional except
+# user_id, so either flow can write without providing the other's
+# fields.
+
 class Feedback(SQLModel, table=True):
     id: Optional[int] = Field(
         default=None,
@@ -1209,10 +1232,27 @@ class Feedback(SQLModel, table=True):
         index=True,
     )
 
-    message: str = Field(
+    # --- Flow 1: generic app feedback ---
+    message: Optional[str] = Field(
+        default=None,
         max_length=1000,
     )
 
+    # --- Flow 2: AI solution feedback ---
+    solution_id: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        index=True,
+    )
+
+    helpful: Optional[bool] = None
+
+    flag_reason: Optional[str] = Field(
+        default=None,
+        max_length=500,
+    )
+
+    # --- Admin / triage metadata ---
     status: str = Field(
         default="unread",
         max_length=20,

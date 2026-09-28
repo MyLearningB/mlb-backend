@@ -147,6 +147,10 @@ async def lifespan(app: FastAPI):
     # --------------------------------------------------------
     # DATABASE
     # --- NOTE: Transition to Alembic for migrations before v1.1 ---
+    # create_all() creates MISSING TABLES only. It will never add
+    # a missing COLUMN to an existing table. If you change a model
+    # on an existing DB, either run an ALTER TABLE by hand or set
+    # up Alembic before deploying.
     # --------------------------------------------------------
 
     create_db_and_tables()
@@ -402,7 +406,7 @@ def submit_onboarding_quiz(
 # STUDY PROFILE (always available)
 # ============================================================
 #
-# NEW. This is the endpoint the client should call when a user
+# This is the endpoint the client should call when a user
 # wants to change their default persona AFTER onboarding. It is
 # intentionally NOT gated by is_first_session.
 
@@ -493,12 +497,11 @@ def adopt_pet(
         select(Pet).where(Pet.user_id == current_user.id)
     ).first()
 
+    # If they already have a pet, they've already onboarded. We do
+    # NOT mutate is_first_session here — doing so used to commit a
+    # state change and then immediately raise 409, leaving the DB
+    # in an odd half-mutated state on any error path.
     if existing_pet:
-        if current_user.is_first_session:
-            current_user.is_first_session = False
-            session.add(current_user)
-            session.commit()
-
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Already adopted!",
@@ -653,8 +656,6 @@ def get_dashboard(
     # ------------------------------------------------
     # Today's sessions (excludes archived plans)
     # ------------------------------------------------
-    # NEW: join StudyPlan to skip archived plans and pull
-    # emoji / color_hex / plan_id for the chip UI.
 
     plans_by_id = {
         p.id: p
@@ -680,7 +681,6 @@ def get_dashboard(
     for s in today_sessions:
         plan = plans_by_id.get(s.plan_id)
         if plan is None:
-            # session belongs to an archived/deleted plan → skip
             continue
         real_today_plan.append(
             TodayPlanSession(
@@ -891,8 +891,6 @@ async def generate_study_plan(
     # --------------------------------------------------------
     # PERSONA RESOLUTION
     # --------------------------------------------------------
-    # Prefer the request's goal_type (per-plan persona);
-    # fall back to the user's onboarding choice.
     resolved_goal_type = (
         payload.goal_type
         or current_user.goal_type
@@ -907,9 +905,6 @@ async def generate_study_plan(
     # --------------------------------------------------------
     # AI GENERATION (persona-aware)
     # --------------------------------------------------------
-    # ai_service.generate_deepseek_study_plan must accept
-    # `goal_type` and inject the persona hint into the prompt.
-    # See the "ai_service.py" note below this file.
     ai_plan_data = await generate_deepseek_study_plan(
         goal=payload.goal,
         target_date=payload.deadline,
@@ -924,71 +919,58 @@ async def generate_study_plan(
         )
 
     # --------------------------------------------------------
-    # PERSIST PLAN
+    # PERSIST PLAN + SESSIONS
     # --------------------------------------------------------
+    # Single transaction for the whole plan. Commit the plan first
+    # so db_plan.id is populated, then add all sessions in one shot.
 
-    db_plan = StudyPlan(
-        user_id=current_user.id,
-        title=payload.title or payload.goal,
-        subject=payload.goal,
-        goal_type=resolved_goal_type,
-        deadline=payload.deadline,
-        emoji=payload.emoji or defaults["emoji"],
-        color_hex=payload.color_hex or defaults["color_hex"],
-        is_approved=False,
-    )
-
-    session.add(db_plan)
-    session.commit()
-    session.refresh(db_plan)
-
-    # --------------------------------------------------------
-    # PERSIST SESSIONS
-    # --------------------------------------------------------
-
-    formatted_sessions: list[SessionDetail] = []
-
-    for ai_session in ai_plan_data.get("sessions", []):
-        db_session = StudySession(
-            plan_id=db_plan.id,
+    try:
+        db_plan = StudyPlan(
             user_id=current_user.id,
-            date=ai_session.get("date", today.isoformat()),
-            time=ai_session.get("time", "12:00"),
-            subject=ai_session.get("subject", payload.goal),
-            duration_mins=ai_session.get("duration_mins", 30),
-            # FIX: normalize AI output so DB never stores
-            # "Review"/"Medium" variants that break the Literal.
-            mode=normalize_mode(ai_session.get("mode", "review")),
-            priority=normalize_priority(ai_session.get("priority", "normal")),
-            completed=False,
+            title=payload.title or payload.goal,
+            subject=payload.goal,
+            goal_type=resolved_goal_type,
+            deadline=payload.deadline,
+            emoji=payload.emoji or defaults["emoji"],
+            color_hex=payload.color_hex or defaults["color_hex"],
+            is_approved=False,
         )
 
-        session.add(db_session)
+        session.add(db_plan)
         session.commit()
-        session.refresh(db_session)
+        session.refresh(db_plan)
 
-        formatted_sessions.append(
-            SessionDetail(
-                id=str(db_session.id),
-                date=db_session.date,
-                time=db_session.time,
-                subject=db_session.subject,
-                duration_mins=db_session.duration_mins,
-                mode=db_session.mode,
-                priority=db_session.priority,
-                completed=False,
+        for ai_session in ai_plan_data.get("sessions", []):
+            session.add(
+                StudySession(
+                    plan_id=db_plan.id,
+                    user_id=current_user.id,
+                    date=ai_session.get("date", today.isoformat()),
+                    time=ai_session.get("time", "12:00"),
+                    subject=ai_session.get("subject", payload.goal),
+                    duration_mins=ai_session.get("duration_mins", 30),
+                    mode=normalize_mode(ai_session.get("mode", "review")),
+                    priority=normalize_priority(
+                        ai_session.get("priority", "normal")
+                    ),
+                    completed=False,
+                )
             )
+
+        session.commit()
+
+    except Exception:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save your study plan. Please try again.",
         )
 
-    # Rebuild the whole response from the DB so we return exactly
-    # what a subsequent GET would return — no AI-shape leakage.
-    return _build_plan_response(
-        db_plan,
-        session.exec(
-            select(StudySession).where(StudySession.plan_id == db_plan.id)
-        ).all(),
-        today,
-    )
+    db_sessions = session.exec(
+        select(StudySession).where(StudySession.plan_id == db_plan.id)
+    ).all()
+
+    return _build_plan_response(db_plan, db_sessions, today)
 
 
 # ============================================================
@@ -1086,11 +1068,6 @@ def archive_plan(
 # ============================================================
 # APPROVE PLAN — legacy route (Flutter currently hits this)
 # ============================================================
-#
-# Flutter sends PATCH /users/me/plan { approved: true }.
-# We approve the user's latest non-archived plan.
-# Once Flutter switches to /plan/{plan_id}/approve, this stays
-# around as a backwards-compatible convenience.
 
 @app.patch(
     "/users/me/plan",
@@ -1266,7 +1243,18 @@ def update_session(
     session.commit()
     session.refresh(db_session)
 
-    return db_session
+    return {
+        "id": str(db_session.id),
+        "plan_id": db_session.plan_id,
+        "date": db_session.date,
+        "time": db_session.time,
+        "subject": db_session.subject,
+        "duration_mins": db_session.duration_mins,
+        "mode": normalize_mode(db_session.mode),
+        "priority": normalize_priority(db_session.priority),
+        "completed": db_session.completed,
+        "skipped": db_session.skipped,
+    }
 
 
 # ============================================================
@@ -1315,11 +1303,22 @@ def complete_session(
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
+    # --------------------------------------------------------
+    # ATOMIC CLAIM OF THE SESSION
+    # --------------------------------------------------------
+    # Two rapid taps used to be able to both pass a
+    # `if db_session.completed: 400` check before either
+    # committed, granting XP twice. SELECT ... FOR UPDATE locks
+    # the row until we commit, so the second request blocks,
+    # then sees completed=True on re-read.
+
     db_session = session.exec(
-        select(StudySession).where(
+        select(StudySession)
+        .where(
             StudySession.id == session_id,
             StudySession.user_id == current_user.id,
         )
+        .with_for_update()
     ).first()
 
     if not db_session or db_session.completed:
@@ -1344,8 +1343,9 @@ def complete_session(
         pet.xp += xp_gained
         session.add(pet)
 
-    # 4. Update Daily Activity (powers the Streak)
-    local_today = get_local_now(x_timezone).date().isoformat()
+    # 4. Update Daily Activity (powers the streak on /dashboard)
+    local_today_date = get_local_now(x_timezone).date()
+    local_today = local_today_date.isoformat()
 
     daily_activity = session.exec(
         select(DailyActivity).where(
@@ -1365,6 +1365,30 @@ def complete_session(
             study_time_mins=db_session.duration_mins,
         )
     session.add(daily_activity)
+
+    # 5. Update the O(1) streak counter on User so
+    #    /users/me/profile agrees with /users/me/dashboard.
+    #
+    #    Previously the profile endpoint read
+    #    User.current_streak / last_active_date, which were
+    #    never written — the profile streak was permanently 0
+    #    even when the dashboard correctly showed "5-day streak".
+    #
+    #    Inlined here (instead of calling update_user_streak)
+    #    so this stays in one transaction with everything else.
+    if current_user.last_active_date != local_today_date:
+        yesterday = local_today_date - timedelta(days=1)
+
+        if current_user.last_active_date == yesterday:
+            current_user.current_streak += 1
+        else:
+            current_user.current_streak = 1
+
+        if current_user.current_streak > current_user.longest_streak:
+            current_user.longest_streak = current_user.current_streak
+
+        current_user.last_active_date = local_today_date
+        session.add(current_user)
 
     session.commit()
 
