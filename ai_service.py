@@ -4,23 +4,21 @@ import os
 import traceback
 from dotenv import load_dotenv
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import List, Optional
 from openai import AsyncOpenAI
 
-# This tells Python to look for the .env file and load it
 load_dotenv()
 
-# Initialize the client pointing to DeepSeek's API
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "your-deepseek-api-key-here")
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"  # Overriding the base URL to DeepSeek
+    base_url="https://api.deepseek.com",
 )
 
 
 # ==========================================
-# CANONICAL VALUES (must match schemas.py Literals)
+# CANONICAL VALUES
 # ==========================================
 
 VALID_MODES = {"review", "flashcard", "feynman"}
@@ -78,10 +76,6 @@ def _normalize_session_type(value) -> str:
 # ==========================================
 # PERSONA HINTS
 # ==========================================
-#
-# Injected into the system prompt so the plan shape and language
-# change with the learner. This is the single biggest lever for
-# "the onboarding choice actually does something."
 
 PERSONA_HINTS = {
     "university": (
@@ -112,13 +106,14 @@ PERSONA_HINTS = {
 
 
 # ==========================================
-# 1. AI SOLVE ENGINE (Screen 10)
+# 1. AI SOLVE ENGINE
 # ==========================================
 
 async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
     """
     Sends the user's question to DeepSeek and forces it to return
-    a highly structured JSON response matching our Flutter app's expectations.
+    a highly structured JSON response matching our Flutter app's
+    expectations.
     """
 
     system_prompt = """
@@ -162,8 +157,6 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
 
         ai_data = json.loads(response.choices[0].message.content)
 
-        # ---- Defensive cleanup so SolveResponse(**data) can't 500 ----
-
         if not isinstance(ai_data.get("steps"), list):
             ai_data["steps"] = []
 
@@ -174,7 +167,6 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
             highlights = step.get("highlight_terms") or []
             if not isinstance(highlights, list):
                 highlights = []
-            # Only keep highlights with the expected shape
             clean_highlights = [
                 {
                     "term": str(h.get("term", "")),
@@ -212,81 +204,305 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
 
 
 # ==========================================
-# 2. AI STUDY PLAN GENERATOR (Screen 9)
+# 2. AI PHASE SKELETON GENERATOR
 # ==========================================
+#
+# Called once when a plan is created, and again at each phase
+# boundary if the arc is rebased. Produces 2–6 contiguous phases
+# that span the entire plan duration.
+#
+# Skipped entirely for spans <= 14 days — one window IS the plan.
 
-async def generate_deepseek_study_plan(
+MIN_PHASE_WEEKS = 2
+MIN_PHASES = 2
+MAX_PHASES = 6
+
+
+async def generate_deepseek_phase_plan(
     goal: str,
-    target_date: Optional[date] = None,
-    days_remaining: Optional[int] = None,
-    goal_type: Optional[str] = None,
+    goal_type: Optional[str],
+    total_weeks: int,
+    minutes_per_day: Optional[int] = None,
+    study_days_per_week: Optional[int] = None,
+    progress_summary: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Prompts DeepSeek to generate a structured 7-day study schedule.
+    Generate a 2–6 phase skeleton spanning `total_weeks`.
 
-    Persona-aware: `goal_type` (university / professional / high_school /
-    self_improvement) is injected into the system prompt so that a WAEC
-    Biology plan looks very different from an ACCA Financial Reporting plan.
-
-    Adapts dynamically for strict deadlines vs continuous learning.
+    `progress_summary` is None for the initial call, and a short
+    natural-language recap for rebases.
     """
+
+    if total_weeks < MIN_PHASE_WEEKS:
+        return None
+
     today_str = date.today().isoformat()
 
-    # ------------------------------------------------
-    # Deadline context
-    # ------------------------------------------------
-    if target_date and days_remaining is not None:
-        context_prompt = (
-            f"Their deadline is in {days_remaining} days "
-            f"({target_date.isoformat()}). Build the plan to prepare them "
-            f"for this specific target, escalating intensity and difficulty "
-            f"as the deadline approaches. Front-load fundamentals and "
-            f"back-load review + past-paper practice."
-        )
-        stats_days = days_remaining
-    else:
-        context_prompt = (
-            "They are learning continuously without a strict deadline. "
-            "Build a sustainable, consistent foundational routine that they "
-            "can keep going for months without burning out."
-        )
-        stats_days = -1  # Indicates "no deadline" to the frontend
-
-    # ------------------------------------------------
-    # Persona context
-    # ------------------------------------------------
     persona_block = PERSONA_HINTS.get(
         goal_type or "",
         "The user's background is unspecified — keep sessions moderate "
         "length and balanced between theory and practice.",
     )
 
+    availability_line = ""
+    if minutes_per_day and study_days_per_week:
+        availability_line = (
+            f"They can study {minutes_per_day} minutes/day, "
+            f"{study_days_per_week} days/week."
+        )
+
+    rebase_block = ""
+    if progress_summary:
+        rebase_block = f"""
+        IMPORTANT — this is a REBASE, not the initial plan.
+        The user has already completed part of the arc. Replan the
+        REMAINING {total_weeks} weeks based on:
+        {progress_summary}
+        Compress anything they've already mastered. Expand anything
+        they struggled with.
+        """
+
     system_prompt = f"""
-    You are myLB AI, an expert academic planner.
-    The user wants to study for "{goal}". {context_prompt}
+    You are myLB AI, an expert curriculum architect.
+    The user is preparing for "{goal}" over the next {total_weeks} weeks.
     Today is {today_str}.
 
     LEARNER PROFILE:
     {persona_block}
 
-    Generate a highly realistic, balanced 7-day study plan starting from today.
-    Include rest days to prevent burnout.
+    {availability_line}
+    {rebase_block}
 
-    You MUST respond in valid JSON format exactly matching this structure:
+    Produce between {MIN_PHASES} and {MAX_PHASES} contiguous phases
+    covering weeks 1 through {total_weeks}. Phase boundaries are
+    inclusive: phase 1 might be weeks 1–4, phase 2 weeks 5–11, etc.
+    They must not overlap and must have no gaps.
+
+    A good arc front-loads foundations, spends the middle on depth
+    and structured practice, and ends with full-length practice and
+    a short taper. Longer spans naturally split into more phases —
+    do not force the same shape for 13 weeks as for 34 weeks.
+
+    You MUST respond in valid JSON:
     {{
-      "stats": {{
-        "days_remaining": {stats_days},
-        "daily_target_mins": 60,
-        "topics_count": 5
-      }},
-      "week": [
+      "phases": [
         {{
-          "date": "YYYY-MM-DD",
-          "day_label": "MON",
-          "has_session": true,
-          "session_type": "study"
+          "name": "Diagnostic & Foundations",
+          "start_week": 1,
+          "end_week": 4,
+          "focus": ["baseline test", "arithmetic", "algebra basics"],
+          "milestone": "Complete diagnostic and log weak areas"
         }}
       ],
+      "total_weeks": {total_weeks}
+    }}
+
+    Rules:
+    - 'start_week' of the first phase must be 1.
+    - 'end_week' of the last phase must be {total_weeks}.
+    - Each phase's start_week must equal previous phase's end_week + 1.
+    - 'focus' should be 3–6 short topic strings, not sentences.
+    - 'milestone' is one concrete measurable checkpoint.
+    """
+
+    try:
+        response = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"Build my {total_weeks}-week phase plan for {goal}.",
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+
+        data = json.loads(response.choices[0].message.content)
+
+        raw_phases = data.get("phases")
+        if not isinstance(raw_phases, list):
+            return None
+
+        clean_phases = []
+        for raw in raw_phases:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                start = int(raw.get("start_week") or 0)
+                end = int(raw.get("end_week") or 0)
+            except (TypeError, ValueError):
+                continue
+            if start < 1 or end < start or end > total_weeks:
+                continue
+
+            focus = raw.get("focus") or []
+            if not isinstance(focus, list):
+                focus = []
+            focus = [str(f).strip() for f in focus if str(f).strip()][:6]
+
+            clean_phases.append(
+                {
+                    "name": str(raw.get("name") or "Phase").strip()[:60],
+                    "start_week": start,
+                    "end_week": end,
+                    "focus": focus,
+                    "milestone": str(raw.get("milestone") or "").strip()[:200],
+                }
+            )
+
+        if not clean_phases:
+            return None
+
+        clean_phases.sort(key=lambda p: p["start_week"])
+
+        if clean_phases[0]["start_week"] != 1:
+            clean_phases[0]["start_week"] = 1
+
+        if clean_phases[-1]["end_week"] != total_weeks:
+            clean_phases[-1]["end_week"] = total_weeks
+
+        for i in range(1, len(clean_phases)):
+            expected_start = clean_phases[i - 1]["end_week"] + 1
+            if clean_phases[i]["start_week"] != expected_start:
+                clean_phases[i]["start_week"] = expected_start
+
+        clean_phases = [
+            p for p in clean_phases
+            if p["end_week"] >= p["start_week"]
+        ]
+
+        if not clean_phases:
+            return None
+
+        if len(clean_phases) > MAX_PHASES:
+            clean_phases = clean_phases[:MAX_PHASES]
+            clean_phases[-1]["end_week"] = total_weeks
+
+        return {
+            "phases": clean_phases,
+            "total_weeks": total_weeks,
+        }
+
+    except Exception as e:
+        print(f"DeepSeek Phase Plan Error: {e}")
+        traceback.print_exc()
+        return None
+
+
+# ==========================================
+# 3. AI WINDOW GENERATOR
+# ==========================================
+#
+# Generates ONE window of sessions at a time. Called on plan
+# creation for the first window, and by plan_rollover.py for
+# every subsequent window.
+
+async def generate_deepseek_study_plan(
+    goal: str,
+    target_date: Optional[date] = None,
+    days_remaining: Optional[int] = None,
+    goal_type: Optional[str] = None,
+    # NEW
+    window_start: Optional[date] = None,
+    window_days: int = 7,
+    phase_context: Optional[dict] = None,
+    recent_topics: Optional[List[str]] = None,
+    recent_skips: Optional[List[str]] = None,
+    pace_feedback: Optional[str] = None,
+    minutes_per_day: Optional[int] = None,
+    study_days_per_week: Optional[int] = None,
+) -> Optional[dict]:
+    """
+    Generate sessions for a single window (default 7 days).
+
+    Backwards-compatible: if `window_start` is None, defaults to
+    today, and the output shape is identical to the old 7-day plan.
+    """
+    if window_start is None:
+        window_start = date.today()
+
+    today_str = window_start.isoformat()
+    window_end = window_start + timedelta(days=window_days - 1)
+
+    # ---- Deadline context ----
+    if target_date and days_remaining is not None:
+        context_prompt = (
+            f"Their deadline is in {days_remaining} days "
+            f"({target_date.isoformat()}). Escalate intensity as the "
+            f"deadline approaches."
+        )
+    else:
+        context_prompt = (
+            "They are learning continuously without a strict deadline. "
+            "Build a sustainable, consistent routine."
+        )
+
+    # ---- Persona ----
+    persona_block = PERSONA_HINTS.get(
+        goal_type or "",
+        "Keep sessions moderate length and balanced between theory and practice.",
+    )
+
+    # ---- Phase context ----
+    phase_block = ""
+    if phase_context:
+        focus_str = ", ".join(phase_context.get("focus", []))
+        phase_block = f"""
+        CURRENT PHASE:
+          Name: {phase_context.get("name", "Current phase")}
+          Focus: {focus_str}
+          Milestone: {phase_context.get("milestone", "")}
+
+        Only schedule topics that serve this focus. Do not introduce
+        topics from future phases.
+        """
+
+    # ---- History ----
+    history_block = ""
+    if recent_topics:
+        history_block += (
+            "RECENT TOPICS (past 14 days):\n"
+            + "\n".join(f"  - {t}" for t in recent_topics[:20])
+            + "\nDo NOT repeat these unless it's an explicit review.\n"
+        )
+    if recent_skips:
+        history_block += (
+            "SKIPPED BY USER:\n"
+            + "\n".join(f"  - {t}" for t in recent_skips[:10])
+            + "\nReschedule skipped topics EARLY in this window, "
+            "and mark them as weak_area priority.\n"
+        )
+    if pace_feedback:
+        history_block += f"USER PACE FEEDBACK: {pace_feedback}\n"
+
+    # ---- Availability ----
+    availability_block = ""
+    if minutes_per_day and study_days_per_week:
+        availability_block = (
+            f"BUDGET: {minutes_per_day} min/day, "
+            f"{study_days_per_week} days/week. Do not exceed.\n"
+        )
+
+    system_prompt = f"""
+    You are myLB AI, an expert academic planner.
+    The user is studying for "{goal}". {context_prompt}
+
+    WINDOW: {today_str} through {window_end.isoformat()}
+    ({window_days} days).
+
+    LEARNER PROFILE:
+    {persona_block}
+
+    {phase_block}
+    {availability_block}
+    {history_block}
+
+    Generate sessions ONLY within the window above.
+    Include rest days where appropriate.
+
+    You MUST respond in valid JSON:
+    {{
       "sessions": [
         {{
           "date": "YYYY-MM-DD",
@@ -300,23 +516,12 @@ async def generate_deepseek_study_plan(
       "nudge": null
     }}
 
-    Rules for 'week':
-    - Generate EXACTLY 7 items, one for each of the next 7 days starting today.
-    - 'day_label' must be a 3-letter uppercase code (MON, TUE, WED, ...).
-    - 'session_type' must be exactly one of: "study", "review", "rest" (lowercase).
-
-    Rules for 'sessions':
-    - Generate ONLY sessions for days where has_session is true.
-    - 'date' must be YYYY-MM-DD and must fall within the 7-day window.
-    - 'time' must be 24-hour HH:MM.
-    - 'mode' must be exactly one of: "review", "flashcard", "feynman" (lowercase).
-    - 'priority' must be exactly one of: "normal", "high", "weak_area" (lowercase).
-    - 'duration_mins' must be a positive integer, appropriate for the learner profile above.
-    - 'subject' should name a specific topic, not the overall goal.
-
-    Vary the modes across the week — do not use the same mode every day.
-    If there is a deadline, place 'weak_area' priorities later in the week
-    on topics that were studied early on.
+    Rules:
+    - 'date' must be between {today_str} and {window_end.isoformat()}.
+    - 'mode' must be exactly: "review", "flashcard", or "feynman".
+    - 'priority' must be exactly: "normal", "high", or "weak_area".
+    - 'subject' must name a specific topic, not the overall goal.
+    - Vary modes; do not use the same mode every day.
     """
 
     try:
@@ -326,7 +531,7 @@ async def generate_deepseek_study_plan(
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": f"Generate my 7-day study plan for {goal}.",
+                    "content": f"Generate my next {window_days} days.",
                 },
             ],
             response_format={"type": "json_object"},
@@ -334,23 +539,25 @@ async def generate_deepseek_study_plan(
 
         plan_data = json.loads(response.choices[0].message.content)
 
-        # ------------------------------------------------
-        # Defensive coercion pass
-        # ------------------------------------------------
-        # The AI is *told* to return canonical lowercase values, but
-        # models drift. This makes the output safe for PlanResponse /
-        # SessionDetail no matter what.
-
         if not isinstance(plan_data.get("sessions"), list):
             plan_data["sessions"] = []
 
-        cleaned_sessions = []
+        clean_sessions = []
         for raw in plan_data["sessions"]:
             if not isinstance(raw, dict):
                 continue
 
+            date_str = str(raw.get("date") or "").strip()
+
+            # Hard-bound: reject anything outside the requested window.
+            try:
+                s_date = date.fromisoformat(date_str)
+            except ValueError:
+                continue
+            if not (window_start <= s_date <= window_end):
+                continue
+
             subject = str(raw.get("subject") or goal).strip() or goal
-            date_str = str(raw.get("date") or today_str).strip()
             time_str = str(raw.get("time") or "16:00").strip()
 
             try:
@@ -359,8 +566,10 @@ async def generate_deepseek_study_plan(
                 duration = 30
             if duration <= 0:
                 duration = 30
+            if duration > 180:
+                duration = 180
 
-            cleaned_sessions.append(
+            clean_sessions.append(
                 {
                     "date": date_str,
                     "time": time_str,
@@ -371,31 +580,11 @@ async def generate_deepseek_study_plan(
                 }
             )
 
-        plan_data["sessions"] = cleaned_sessions
-
-        # Week items — normalise session_type, keep only 7
-        if isinstance(plan_data.get("week"), list):
-            clean_week = []
-            for day in plan_data["week"][:7]:
-                if not isinstance(day, dict):
-                    continue
-                clean_week.append(
-                    {
-                        "date": str(day.get("date") or "").strip(),
-                        "day_label": str(day.get("day_label") or "").strip().upper()[:3],
-                        "has_session": bool(day.get("has_session", False)),
-                        "session_type": _normalize_session_type(day.get("session_type")),
-                    }
-                )
-            plan_data["week"] = clean_week
-
-        # Ensure nudge key exists (main.py currently overrides to None,
-        # but keeping the shape stable helps if that ever changes)
+        plan_data["sessions"] = clean_sessions
         plan_data.setdefault("nudge", None)
-
         return plan_data
 
     except Exception as e:
-        print(f"DeepSeek AI Plan Error: {e}")
+        print(f"DeepSeek Window Plan Error: {e}")
         traceback.print_exc()
         return None

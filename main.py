@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional
+import asyncio
 import json
 import os
 
@@ -61,80 +61,50 @@ from schemas import (
     UserDashboardInfo,
     PetDashboardInfo,
     StreakInfo,
-    PlanResponse,
-    PlanGoal,
-    PlanStats,
-    PlanGenerateRequest,
-    PlanUpdateRequest,
-    PlanArchiveRequest,
-    PlanListItem,
-    PlanListResponse,
-    SessionUpdateRequest,
-    SessionDetail,
-    PlanApproveRequest,
     SolveRequest,
     SolveResponse,
     SolveFeedbackRequest,
     TodayPlanSession,
-    WeekDay,
     OnboardingQuizSubmit,
     StudyProfileUpdate,
-    ManualSessionCreate,
-    # NEW: shared normalizers
     normalize_mode,
-    normalize_priority,
 )
 
 # ============================================================
 # AI SERVICE
 # ============================================================
 
-from ai_service import (
-    generate_deepseek_solution,
-    generate_deepseek_study_plan,
-)
+from ai_service import generate_deepseek_solution
+
+# ============================================================
+# ROLLOVER
+# ============================================================
+
+from plan_rollover import plan_rollover_loop
 
 # ============================================================
 # ROUTERS
 # ============================================================
 
 from routers import (
+    auth,
+    canvas,
     collections,
     community,
-    notifications,
-    study,
     notes,
-    canvas,
+    notifications,
+    plan,
     profile,
+    study,
     trophies,
-    auth,
 )
 
 from routers.auth import limiter
-from utils import get_pet_evolution_data
-
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-ALLOWED_GOAL_TYPES = {
-    "university",
-    "professional",
-    "high_school",
-    "self_improvement",
-}
-
-# Per-persona default emoji + accent colour.
-# Used when the client doesn't supply their own, so that
-# a uni student and a chess learner see visually different
-# chips on the dashboard.
-GOAL_TYPE_DEFAULTS = {
-    "university":        {"emoji": "🎓", "color_hex": "#7C6EE6"},
-    "professional":      {"emoji": "💼", "color_hex": "#3CFFC8"},
-    "high_school":       {"emoji": "📚", "color_hex": "#FF8A65"},
-    "self_improvement":  {"emoji": "✨", "color_hex": "#C8F53C"},
-}
+from utils import (
+    ALLOWED_GOAL_TYPES,
+    get_local_now,
+    get_pet_evolution_data,
+)
 
 
 # ============================================================
@@ -143,21 +113,7 @@ GOAL_TYPE_DEFAULTS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # --------------------------------------------------------
-    # DATABASE
-    # --- NOTE: Transition to Alembic for migrations before v1.1 ---
-    # create_all() creates MISSING TABLES only. It will never add
-    # a missing COLUMN to an existing table. If you change a model
-    # on an existing DB, either run an ALTER TABLE by hand or set
-    # up Alembic before deploying.
-    # --------------------------------------------------------
-
     create_db_and_tables()
-
-    # --------------------------------------------------------
-    # FIREBASE
-    # --------------------------------------------------------
 
     firebase_json_str = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
@@ -177,7 +133,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ Error initializing Firebase: {e}")
 
+    rollover_task = asyncio.create_task(plan_rollover_loop())
+
     yield
+
+    rollover_task.cancel()
+    try:
+        await rollover_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ============================================================
@@ -234,6 +198,9 @@ app.include_router(notifications.router)
 app.include_router(community.router)
 app.include_router(trophies.router)
 
+# Study plan (generate / approve / adjust / complete)
+app.include_router(plan.router)
+
 app.include_router(
     profile.router,
     prefix="/users/me",
@@ -251,104 +218,7 @@ def keep_alive():
 
 
 # ============================================================
-# TIMEZONE HELPER
-# ============================================================
-
-def get_local_now(timezone_str: str = "UTC") -> datetime:
-    try:
-        tz = ZoneInfo(timezone_str)
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("UTC")
-    return datetime.now(tz)
-
-
-# ============================================================
-# INTERNAL HELPERS
-# ============================================================
-
-def _persona_defaults(goal_type: Optional[str]) -> dict:
-    """Return the default emoji / color_hex for a goal_type."""
-    return GOAL_TYPE_DEFAULTS.get(
-        goal_type or "",
-        {"emoji": "🎯", "color_hex": "#7C6EE6"},
-    )
-
-
-def _build_plan_response(
-    db_plan: StudyPlan,
-    db_sessions: list,
-    local_today: date,
-) -> PlanResponse:
-    """Shared PlanResponse builder used by GET /plan and GET /plan/{id}."""
-    if db_plan.deadline:
-        days_remaining = max((db_plan.deadline - local_today).days, 0)
-    else:
-        days_remaining = -1
-
-    total_duration = sum(s.duration_mins for s in db_sessions)
-    daily_target = (
-        total_duration // len(db_sessions)
-        if db_sessions
-        else 60
-    )
-
-    stats = PlanStats(
-        days_remaining=days_remaining,
-        daily_target_mins=daily_target,
-        topics_count=len(db_sessions),
-    )
-
-    week = []
-    for i in range(7):
-        current_date = local_today + timedelta(days=i)
-        date_str = current_date.isoformat()
-        day_session = next(
-            (s for s in db_sessions if s.date == date_str),
-            None,
-        )
-        week.append(
-            WeekDay(
-                date=date_str,
-                day_label=current_date.strftime("%a").upper(),
-                has_session=bool(day_session),
-                session_type="study" if day_session else "rest",
-            )
-        )
-
-    formatted_sessions = [
-        SessionDetail(
-            id=str(s.id),
-            date=s.date,
-            time=s.time or "16:00",
-            subject=s.subject,
-            duration_mins=s.duration_mins,
-            mode=normalize_mode(s.mode),
-            priority=normalize_priority(s.priority),
-            completed=s.completed,
-        )
-        for s in db_sessions
-    ]
-
-    return PlanResponse(
-        plan_id=db_plan.id,
-        title=db_plan.title or db_plan.subject,
-        goal_type=db_plan.goal_type or "self_improvement",
-        emoji=db_plan.emoji,
-        color_hex=db_plan.color_hex,
-        is_approved=db_plan.is_approved,
-        goal=PlanGoal(
-            subject=db_plan.subject,
-            deadline=db_plan.deadline,
-        ),
-        stats=stats,
-        week=week,
-        sessions=formatted_sessions,
-        nudge=None,
-    )
-
-
-# ============================================================
-# ONBOARDING QUIZ (first-session only)
+# ONBOARDING QUIZ
 # ============================================================
 
 @app.patch(
@@ -361,11 +231,6 @@ def submit_onboarding_quiz(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    """
-    Save the user's onboarding quiz answer. Only allowed once
-    (guarded by is_first_session). For later edits, use
-    PATCH /users/me/study-profile.
-    """
     if request.goal_type not in ALLOWED_GOAL_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -403,12 +268,8 @@ def submit_onboarding_quiz(
 
 
 # ============================================================
-# STUDY PROFILE (always available)
+# STUDY PROFILE
 # ============================================================
-#
-# This is the endpoint the client should call when a user
-# wants to change their default persona AFTER onboarding. It is
-# intentionally NOT gated by is_first_session.
 
 @app.patch(
     "/users/me/study-profile",
@@ -497,10 +358,6 @@ def adopt_pet(
         select(Pet).where(Pet.user_id == current_user.id)
     ).first()
 
-    # If they already have a pet, they've already onboarded. We do
-    # NOT mutate is_first_session here — doing so used to commit a
-    # state change and then immediately raise 409, leaving the DB
-    # in an odd half-mutated state on any error path.
     if existing_pet:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -653,16 +510,12 @@ def get_dashboard(
 
     pet_info = PetDashboardInfo(**pet_info_dict)
 
-    # ------------------------------------------------
-    # Today's sessions (excludes archived plans)
-    # ------------------------------------------------
-
     plans_by_id = {
         p.id: p
         for p in session.exec(
             select(StudyPlan).where(
                 StudyPlan.user_id == current_user.id,
-                StudyPlan.is_archived == False,
+                StudyPlan.is_archived == False,  # noqa: E712
             )
         ).all()
     }
@@ -672,7 +525,7 @@ def get_dashboard(
         .where(
             StudySession.user_id == current_user.id,
             StudySession.date == today_str,
-            StudySession.completed == False,
+            StudySession.completed == False,  # noqa: E712
         )
         .order_by(StudySession.id)
     ).all()
@@ -723,676 +576,6 @@ def get_dashboard(
         study_goal=current_user.study_goal,
         target_date=current_user.target_date,
     )
-
-
-# ============================================================
-# LIST ALL PLANS (multi-goal switcher)
-# ============================================================
-
-@app.get(
-    "/users/me/plans",
-    response_model=PlanListResponse,
-    status_code=status.HTTP_200_OK,
-)
-def list_study_plans(
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-    x_timezone: str = Header("UTC"),
-    include_archived: bool = False,
-):
-    today = get_local_now(x_timezone).date()
-
-    query = select(StudyPlan).where(StudyPlan.user_id == current_user.id)
-
-    if not include_archived:
-        query = query.where(StudyPlan.is_archived == False)
-
-    plans = session.exec(
-        query.order_by(StudyPlan.created_at.desc())
-    ).all()
-
-    items: list[PlanListItem] = []
-
-    for plan in plans:
-        sessions = session.exec(
-            select(StudySession).where(StudySession.plan_id == plan.id)
-        ).all()
-
-        completed_count = sum(1 for s in sessions if s.completed)
-
-        days_remaining = None
-        if plan.deadline:
-            days_remaining = max((plan.deadline - today).days, 0)
-
-        items.append(
-            PlanListItem(
-                plan_id=plan.id,
-                title=plan.title or plan.subject,
-                subject=plan.subject,
-                goal_type=plan.goal_type or "self_improvement",
-                deadline=plan.deadline,
-                emoji=plan.emoji,
-                color_hex=plan.color_hex,
-                is_approved=plan.is_approved,
-                is_archived=plan.is_archived,
-                days_remaining=days_remaining,
-                session_count=len(sessions),
-                completed_count=completed_count,
-            )
-        )
-
-    return PlanListResponse(plans=items, total_count=len(items))
-
-
-# ============================================================
-# GET LATEST PLAN (kept for Flutter compat)
-# ============================================================
-
-@app.get(
-    "/users/me/plan",
-    response_model=Optional[PlanResponse],
-    status_code=status.HTTP_200_OK,
-)
-def get_latest_study_plan(
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-    x_timezone: str = Header("UTC"),
-):
-    db_plan = session.exec(
-        select(StudyPlan)
-        .where(
-            StudyPlan.user_id == current_user.id,
-            StudyPlan.is_archived == False,
-        )
-        .order_by(StudyPlan.id.desc())
-    ).first()
-
-    if not db_plan:
-        return None
-
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        get_local_now(x_timezone).date(),
-    )
-
-
-# ============================================================
-# GET PLAN BY ID
-# ============================================================
-
-@app.get(
-    "/users/me/plan/{plan_id}",
-    response_model=PlanResponse,
-    status_code=status.HTTP_200_OK,
-)
-def get_study_plan_by_id(
-    plan_id: int,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-    x_timezone: str = Header("UTC"),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Study plan not found.",
-        )
-
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        get_local_now(x_timezone).date(),
-    )
-
-
-# ============================================================
-# GENERATE STUDY PLAN
-# ============================================================
-
-@app.post(
-    "/users/me/plan/generate",
-    response_model=PlanResponse,
-    status_code=status.HTTP_200_OK,
-)
-@limiter.limit("5/minute")
-async def generate_study_plan(
-    request: Request,
-    payload: PlanGenerateRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-    x_timezone: str = Header("UTC"),
-):
-    today = get_local_now(x_timezone).date()
-
-    days_remaining = None
-    if payload.deadline:
-        days_remaining = (payload.deadline - today).days
-        if days_remaining < 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Deadline passed.",
-            )
-
-    # --------------------------------------------------------
-    # PERSONA RESOLUTION
-    # --------------------------------------------------------
-    resolved_goal_type = (
-        payload.goal_type
-        or current_user.goal_type
-        or "self_improvement"
-    )
-
-    if resolved_goal_type not in ALLOWED_GOAL_TYPES:
-        resolved_goal_type = "self_improvement"
-
-    defaults = _persona_defaults(resolved_goal_type)
-
-    # --------------------------------------------------------
-    # AI GENERATION (persona-aware)
-    # --------------------------------------------------------
-    ai_plan_data = await generate_deepseek_study_plan(
-        goal=payload.goal,
-        target_date=payload.deadline,
-        days_remaining=days_remaining,
-        goal_type=resolved_goal_type,
-    )
-
-    if not ai_plan_data:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate plan.",
-        )
-
-    # --------------------------------------------------------
-    # PERSIST PLAN + SESSIONS
-    # --------------------------------------------------------
-    # Single transaction for the whole plan. Commit the plan first
-    # so db_plan.id is populated, then add all sessions in one shot.
-
-    try:
-        db_plan = StudyPlan(
-            user_id=current_user.id,
-            title=payload.title or payload.goal,
-            subject=payload.goal,
-            goal_type=resolved_goal_type,
-            deadline=payload.deadline,
-            emoji=payload.emoji or defaults["emoji"],
-            color_hex=payload.color_hex or defaults["color_hex"],
-            is_approved=False,
-        )
-
-        session.add(db_plan)
-        session.commit()
-        session.refresh(db_plan)
-
-        for ai_session in ai_plan_data.get("sessions", []):
-            session.add(
-                StudySession(
-                    plan_id=db_plan.id,
-                    user_id=current_user.id,
-                    date=ai_session.get("date", today.isoformat()),
-                    time=ai_session.get("time", "12:00"),
-                    subject=ai_session.get("subject", payload.goal),
-                    duration_mins=ai_session.get("duration_mins", 30),
-                    mode=normalize_mode(ai_session.get("mode", "review")),
-                    priority=normalize_priority(
-                        ai_session.get("priority", "normal")
-                    ),
-                    completed=False,
-                )
-            )
-
-        session.commit()
-
-    except Exception:
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not save your study plan. Please try again.",
-        )
-
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(db_plan, db_sessions, today)
-
-
-# ============================================================
-# UPDATE PLAN METADATA
-# ============================================================
-
-@app.patch(
-    "/users/me/plan/{plan_id}",
-    status_code=status.HTTP_200_OK,
-)
-def update_plan_metadata(
-    plan_id: int,
-    payload: PlanUpdateRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-
-    if payload.title is not None:
-        db_plan.title = payload.title
-    if payload.deadline is not None:
-        db_plan.deadline = payload.deadline
-    if payload.emoji is not None:
-        db_plan.emoji = payload.emoji
-    if payload.color_hex is not None:
-        db_plan.color_hex = payload.color_hex
-    if payload.goal_type is not None:
-        if payload.goal_type not in ALLOWED_GOAL_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid goal type.",
-            )
-        db_plan.goal_type = payload.goal_type
-
-    session.add(db_plan)
-    session.commit()
-    session.refresh(db_plan)
-
-    return {
-        "message": "Plan updated.",
-        "plan_id": db_plan.id,
-        "title": db_plan.title,
-    }
-
-
-# ============================================================
-# ARCHIVE / UNARCHIVE PLAN
-# ============================================================
-
-@app.post(
-    "/users/me/plan/{plan_id}/archive",
-    status_code=status.HTTP_200_OK,
-)
-def archive_plan(
-    plan_id: int,
-    payload: PlanArchiveRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-
-    db_plan.is_archived = payload.archived
-    session.add(db_plan)
-    session.commit()
-
-    return {
-        "message": "Plan archived." if payload.archived else "Plan restored.",
-        "plan_id": db_plan.id,
-        "is_archived": db_plan.is_archived,
-    }
-
-
-# ============================================================
-# APPROVE PLAN — legacy route (Flutter currently hits this)
-# ============================================================
-
-@app.patch(
-    "/users/me/plan",
-    status_code=status.HTTP_200_OK,
-)
-def approve_latest_plan_legacy(
-    request: PlanApproveRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan)
-        .where(
-            StudyPlan.user_id == current_user.id,
-            StudyPlan.is_archived == False,
-        )
-        .order_by(StudyPlan.id.desc())
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No plan to approve.",
-        )
-
-    db_plan.is_approved = request.approved
-    session.add(db_plan)
-    session.commit()
-    session.refresh(db_plan)
-
-    return {
-        "message": f"Plan {db_plan.id} approved status updated",
-        "approved": db_plan.is_approved,
-        "plan_id": db_plan.id,
-    }
-
-
-# ============================================================
-# APPROVE PLAN — canonical per-plan route
-# ============================================================
-
-@app.patch(
-    "/users/me/plan/{plan_id}/approve",
-    status_code=status.HTTP_200_OK,
-)
-def approve_study_plan(
-    plan_id: int,
-    request: PlanApproveRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-
-    db_plan.is_approved = request.approved
-    session.add(db_plan)
-    session.commit()
-    session.refresh(db_plan)
-
-    return {
-        "message": f"Plan {plan_id} approved status updated",
-        "approved": db_plan.is_approved,
-    }
-
-
-# ============================================================
-# CREATE MANUAL STUDY SESSION
-# ============================================================
-
-@app.post(
-    "/users/me/plan/{plan_id}/session",
-    status_code=status.HTTP_201_CREATED,
-)
-def add_manual_session(
-    plan_id: int,
-    payload: ManualSessionCreate,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Study plan not found.",
-        )
-
-    new_session = StudySession(
-        plan_id=db_plan.id,
-        user_id=current_user.id,
-        date=payload.date,
-        time=payload.time,
-        subject=payload.subject,
-        duration_mins=payload.duration_mins,
-        mode=normalize_mode(payload.mode),
-        priority=normalize_priority(payload.priority),
-        completed=False,
-    )
-
-    session.add(new_session)
-    session.commit()
-    session.refresh(new_session)
-
-    return {
-        "message": "Session added successfully",
-        "session": {
-            "id": str(new_session.id),
-            "date": new_session.date,
-            "subject": new_session.subject,
-            "duration_mins": new_session.duration_mins,
-            "mode": new_session.mode,
-        },
-    }
-
-
-# ============================================================
-# UPDATE STUDY SESSION
-# ============================================================
-
-@app.patch(
-    "/users/me/plan/session/{session_id}",
-    status_code=status.HTTP_200_OK,
-)
-def update_session(
-    session_id: int,
-    request: SessionUpdateRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_session = session.exec(
-        select(StudySession).where(
-            StudySession.id == session_id,
-            StudySession.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found.",
-        )
-
-    if request.scheduled_time is not None:
-        db_session.time = request.scheduled_time
-
-    if request.duration_mins is not None:
-        if request.duration_mins <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Duration must be greater than zero.",
-            )
-        db_session.duration_mins = request.duration_mins
-
-    if request.skipped is not None:
-        db_session.skipped = request.skipped
-
-    session.add(db_session)
-    session.commit()
-    session.refresh(db_session)
-
-    return {
-        "id": str(db_session.id),
-        "plan_id": db_session.plan_id,
-        "date": db_session.date,
-        "time": db_session.time,
-        "subject": db_session.subject,
-        "duration_mins": db_session.duration_mins,
-        "mode": normalize_mode(db_session.mode),
-        "priority": normalize_priority(db_session.priority),
-        "completed": db_session.completed,
-        "skipped": db_session.skipped,
-    }
-
-
-# ============================================================
-# DELETE STUDY SESSION
-# ============================================================
-
-@app.delete(
-    "/users/me/plan/session/{session_id}",
-    status_code=status.HTTP_200_OK,
-)
-def delete_session(
-    session_id: int,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    db_session = session.exec(
-        select(StudySession).where(
-            StudySession.id == session_id,
-            StudySession.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found.",
-        )
-
-    session.delete(db_session)
-    session.commit()
-
-    return {"message": "Session removed from plan."}
-
-
-# ============================================================
-# COMPLETE STUDY SESSION & GRANT XP
-# ============================================================
-
-@app.post(
-    "/users/me/plan/session/{session_id}/complete",
-    status_code=status.HTTP_200_OK,
-)
-def complete_session(
-    session_id: int,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-    x_timezone: str = Header("UTC"),
-):
-    # --------------------------------------------------------
-    # ATOMIC CLAIM OF THE SESSION
-    # --------------------------------------------------------
-    # Two rapid taps used to be able to both pass a
-    # `if db_session.completed: 400` check before either
-    # committed, granting XP twice. SELECT ... FOR UPDATE locks
-    # the row until we commit, so the second request blocks,
-    # then sees completed=True on re-read.
-
-    db_session = session.exec(
-        select(StudySession)
-        .where(
-            StudySession.id == session_id,
-            StudySession.user_id == current_user.id,
-        )
-        .with_for_update()
-    ).first()
-
-    if not db_session or db_session.completed:
-        raise HTTPException(
-            status_code=400,
-            detail="Session invalid or already completed.",
-        )
-
-    # 1. Mark complete
-    db_session.completed = True
-    session.add(db_session)
-
-    # 2. Grant XP based on duration
-    xp_gained = db_session.duration_mins
-
-    # 3. Add to Pet
-    pet = session.exec(
-        select(Pet).where(Pet.user_id == current_user.id)
-    ).first()
-
-    if pet:
-        pet.xp += xp_gained
-        session.add(pet)
-
-    # 4. Update Daily Activity (powers the streak on /dashboard)
-    local_today_date = get_local_now(x_timezone).date()
-    local_today = local_today_date.isoformat()
-
-    daily_activity = session.exec(
-        select(DailyActivity).where(
-            DailyActivity.user_id == current_user.id,
-            DailyActivity.date == local_today,
-        )
-    ).first()
-
-    if daily_activity:
-        daily_activity.xp_earned += xp_gained
-        daily_activity.study_time_mins += db_session.duration_mins
-    else:
-        daily_activity = DailyActivity(
-            user_id=current_user.id,
-            date=local_today,
-            xp_earned=xp_gained,
-            study_time_mins=db_session.duration_mins,
-        )
-    session.add(daily_activity)
-
-    # 5. Update the O(1) streak counter on User so
-    #    /users/me/profile agrees with /users/me/dashboard.
-    #
-    #    Previously the profile endpoint read
-    #    User.current_streak / last_active_date, which were
-    #    never written — the profile streak was permanently 0
-    #    even when the dashboard correctly showed "5-day streak".
-    #
-    #    Inlined here (instead of calling update_user_streak)
-    #    so this stays in one transaction with everything else.
-    if current_user.last_active_date != local_today_date:
-        yesterday = local_today_date - timedelta(days=1)
-
-        if current_user.last_active_date == yesterday:
-            current_user.current_streak += 1
-        else:
-            current_user.current_streak = 1
-
-        if current_user.current_streak > current_user.longest_streak:
-            current_user.longest_streak = current_user.current_streak
-
-        current_user.last_active_date = local_today_date
-        session.add(current_user)
-
-    session.commit()
-
-    return {"message": "Session completed!", "xp_gained": xp_gained}
 
 
 # ============================================================

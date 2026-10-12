@@ -2,6 +2,7 @@ import uuid
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import List, Optional
+from sqlalchemy import event
 
 from sqlmodel import SQLModel, Field, Relationship
 
@@ -381,6 +382,27 @@ class Quest(SQLModel, table=True):
 # ==========================================
 # STUDY PLAN
 # ==========================================
+#
+# A StudyPlan is a long-running goal (a GRE prep, a WAEC Biology
+# exam, a self-directed chess project). Its sessions are NOT
+# generated all at once — they arrive one window at a time via
+# plan_rollover.py.
+#
+#   * start_date    : the day the plan was created; anchors week
+#                     numbering and phase boundaries.
+#   * window_start  : the first day of the currently-generated
+#                     session window. Rollover advances this by
+#                     window_days each time it fires.
+#   * window_days   : how many days each window covers (default 7).
+#                     Shrinks to fit if the deadline is tighter
+#                     than a week.
+#   * phase_plan    : JSON blob of PhasePlan (see schemas.py).
+#                     Produced by generate_deepseek_phase_plan.
+#                     Contains 2–6 contiguous phases spanning the
+#                     whole duration. Null for spans < 2 weeks.
+#   * arc_version   : bumped whenever the arc is rebased, so we
+#                     can tell which skeleton a plan was using on
+#                     a given day. Useful for debugging.
 
 class StudyPlan(SQLModel, table=True):
     id: Optional[int] = Field(
@@ -418,7 +440,51 @@ class StudyPlan(SQLModel, table=True):
     # Soft delete so we never blow away session history.
     is_archived: bool = Field(default=False, index=True)
 
-    created_at: datetime = Field(default_factory=utc_now)
+    # --------------------------------------
+    # ROLLING WINDOW
+    # --------------------------------------
+
+    start_date: Optional[date] = Field(
+        default=None,
+        index=True,
+    )
+
+    window_start: Optional[date] = Field(
+        default=None,
+    )
+
+    window_days: int = Field(
+        default=7,
+        ge=1,
+        le=28,
+    )
+
+    # --------------------------------------
+    # PHASE SKELETON
+    # --------------------------------------
+
+    # JSON-serialized PhasePlan. Kept as text so we don't need
+    # a child table for 5 rows of data that are never queried
+    # individually.
+    phase_plan: Optional[str] = Field(
+        default=None,
+    )
+
+    arc_version: int = Field(
+        default=1,
+    )
+
+    # --------------------------------------
+    # TIMESTAMPS
+    # --------------------------------------
+
+    created_at: datetime = Field(
+        default_factory=utc_now,
+    )
+
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+    )
 
     user: Optional["User"] = Relationship(
         back_populates="study_plans",
@@ -429,6 +495,9 @@ class StudyPlan(SQLModel, table=True):
         cascade_delete=True,
     )
 
+@event.listens_for(StudyPlan, "before_update")
+def _touch_study_plan_updated_at(mapper, connection, target):
+    target.updated_at = utc_now()
 
 class StudySession(SQLModel, table=True):
     id: Optional[int] = Field(

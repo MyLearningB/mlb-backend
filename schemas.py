@@ -15,12 +15,6 @@ from pydantic import (
 # ==========================================
 # NORMALIZERS (shared with main.py)
 # ==========================================
-#
-# The AI sometimes returns "Review", "Flashcards", "Feynman",
-# "Medium", "Weak Area". The Literal types below only accept
-# lowercase singular forms. These normalizers map every variant
-# to the canonical form so Pydantic validation never explodes
-# on AI output.
 
 _MODE_ALIASES = {
     "review": "review",
@@ -140,9 +134,7 @@ class OnboardingQuizSubmit(BaseModel):
 class StudyProfileUpdate(BaseModel):
     """
     Always-available endpoint for updating the user's default persona.
-    Unlike OnboardingQuizSubmit, this is not gated by is_first_session —
-    it's how a user later changes their primary goal, or how the
-    client keeps User.goal_type in sync with the persona picker.
+    Unlike OnboardingQuizSubmit, this is not gated by is_first_session.
     """
     goal_type: Optional[str] = None
     study_goal: Optional[str] = None
@@ -164,6 +156,14 @@ class PetDashboardInfo(BaseModel):
     level: int
     xp: int
     xp_to_next: int
+
+    # NEW — within-level XP detail so the Flutter side doesn't
+    # have to do arithmetic. Both are 0 when is_maxed is true.
+    #   * xp_into_level  — XP earned inside the current level
+    #   * level_xp_span  — total XP the current level requires
+    xp_into_level: int = 0
+    level_xp_span: int = 0
+
     mood: str
     xp_history: List[int]
 
@@ -190,12 +190,6 @@ class Quest(BaseModel):
 
 
 class TodayPlanSession(BaseModel):
-    """
-    A single chip on the dashboard's "Today's Plan" row.
-
-    plan_id / emoji / color_hex let the Flutter side group chips
-    by plan and colour them consistently with the plan switcher.
-    """
     id: str
     plan_id: Optional[int] = None
     subject: str
@@ -219,7 +213,7 @@ class DashboardResponse(BaseModel):
 
 
 # ==========================================
-# STUDY PLAN
+# STUDY PLAN — shared primitives
 # ==========================================
 
 class PlanGoal(BaseModel):
@@ -251,6 +245,7 @@ class SessionDetail(BaseModel):
     priority: Literal["normal", "high", "weak_area"]
 
     completed: bool
+    skipped: bool = False
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -269,11 +264,31 @@ class Nudge(BaseModel):
     session_id: Optional[str] = None
 
 
+# ==========================================
+# PHASE PLAN
+# ==========================================
+
+class PlanPhase(BaseModel):
+    """A contiguous stretch of the arc (see generate_deepseek_phase_plan)."""
+    name: str
+    start_week: int = Field(..., ge=1)
+    end_week: int = Field(..., ge=1)
+    focus: List[str] = Field(default_factory=list)
+    milestone: str = ""
+
+
+class PhasePlan(BaseModel):
+    phases: List[PlanPhase]
+    total_weeks: int = Field(..., ge=1)
+
+
+# ==========================================
+# PLAN RESPONSE
+# ==========================================
+
 class PlanResponse(BaseModel):
-    # NEW: so the client can address the plan (approve / adjust / archive)
     plan_id: int
 
-    # NEW: multi-goal metadata
     title: str
     goal_type: str
     emoji: Optional[str] = None
@@ -286,23 +301,38 @@ class PlanResponse(BaseModel):
     sessions: List[SessionDetail]
     nudge: Optional[Nudge] = None
 
+    # Arc metadata (computed in routers/plan.py)
+    total_weeks: Optional[int] = None
+    current_week: Optional[int] = None
+    phase_name: Optional[str] = None
+    phase_milestone: Optional[str] = None
+
+    updated_at: Optional[datetime] = None
+
+
+# ==========================================
+# PLAN REQUESTS
+# ==========================================
+
+class PlanAvailability(BaseModel):
+    minutes_per_day: Optional[int] = Field(default=None, ge=15, le=600)
+    study_days_per_week: Optional[int] = Field(default=None, ge=1, le=7)
+
 
 class PlanGenerateRequest(BaseModel):
-    goal: str
+    goal: str = Field(..., min_length=1, max_length=200)
     deadline: Optional[date] = None
 
-    # NEW: caller can override the persona for this plan.
-    # If omitted, main.py falls back to current_user.goal_type.
     goal_type: Optional[str] = None
 
-    # NEW: optional display metadata for the chip UI
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=80)
     emoji: Optional[str] = Field(default=None, max_length=10)
     color_hex: Optional[str] = Field(default=None, max_length=9)
 
+    availability: Optional[PlanAvailability] = None
+
 
 class PlanUpdateRequest(BaseModel):
-    """Rename / recolour / re-deadline an existing plan."""
     title: Optional[str] = Field(default=None, max_length=80)
     deadline: Optional[date] = None
     emoji: Optional[str] = Field(default=None, max_length=10)
@@ -344,7 +374,7 @@ class PlanApproveRequest(BaseModel):
 
 
 # ==========================================
-# PLAN LIST (multi-goal dashboard / switcher)
+# PLAN LIST (multi-goal switcher)
 # ==========================================
 
 class PlanListItem(BaseModel):
