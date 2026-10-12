@@ -76,10 +76,7 @@ def _compute_arc_metadata(
     Optional[str],
     Optional[str],
 ]:
-    """
-    Return (total_weeks, current_week, phase_name, phase_milestone).
-    All None when the plan has no deadline.
-    """
+    """Return (total_weeks, current_week, phase_name, phase_milestone)."""
     if not db_plan.start_date or not db_plan.deadline:
         return None, None, None, None
 
@@ -143,20 +140,39 @@ def _build_plan_response(
         topics_count=distinct_topics,
     )
 
+    # ----------------------------------------------------------
+    # Week strip — richer session_type
+    # ----------------------------------------------------------
+    # The Flutter strip reads `session_type` to pick the dot
+    # colour under each pill. It supports "study" (green),
+    # "review" (peach), "weak_area" (peach), and "rest" (no dot).
+    # Previously this emitted only "study" / "rest", so the two
+    # peach branches in the widget were dead code.
     week = []
     for i in range(7):
         current_date = local_today + timedelta(days=i)
         date_str = current_date.isoformat()
-        day_session = next(
-            (s for s in upcoming_sorted if s.date == date_str),
-            None,
-        )
+
+        day_sessions = [s for s in upcoming_sorted if s.date == date_str]
+
+        if not day_sessions:
+            session_type = "rest"
+        elif any(
+            normalize_priority(s.priority) == "weak_area"
+            for s in day_sessions
+        ):
+            session_type = "weak_area"
+        elif any(normalize_mode(s.mode) == "review" for s in day_sessions):
+            session_type = "review"
+        else:
+            session_type = "study"
+
         week.append(
             WeekDay(
                 date=date_str,
                 day_label=current_date.strftime("%a").upper(),
-                has_session=bool(day_session),
-                session_type="study" if day_session else "rest",
+                has_session=bool(day_sessions),
+                session_type=session_type,
             )
         )
 

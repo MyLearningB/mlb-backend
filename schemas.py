@@ -231,7 +231,7 @@ class WeekDay(BaseModel):
     date: str
     day_label: str
     has_session: bool
-    session_type: Literal["study", "review", "rest"]
+    session_type: Literal["study", "review", "rest", "weak_area"]
 
 
 class SessionDetail(BaseModel):
