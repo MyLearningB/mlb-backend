@@ -447,14 +447,8 @@ def delete_account(
     session: Session = Depends(get_session),
 ):
     """
-    Delete account and all associated user data.
-
-    Relies on ON DELETE CASCADE set on the database tables for
-    the user's owned rows. If the migration hasn't been applied,
-    the delete raises an IntegrityError and we surface it.
+    Delete account and all associated user data safely.
     """
-    # `.strip()` so trailing whitespace from the text field
-    # doesn't fail the check.
     if data.confirmation.strip() != "DELETE MY ACCOUNT":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -462,8 +456,47 @@ def delete_account(
         )
 
     try:
+        # 1. EXPLICITLY DELETE RELATED DATA FIRST
+        # This prevents Foreign Key IntegrityErrors if your database 
+        # migrations don't have perfect ON DELETE CASCADE configurations.
+        user_id = current_user.id
+
+        # Delete Pet
+        pets = session.exec(select(Pet).where(Pet.user_id == user_id)).all()
+        for pet in pets: session.delete(pet)
+
+        # Delete Daily Activities
+        activities = session.exec(select(DailyActivity).where(DailyActivity.user_id == user_id)).all()
+        for act in activities: session.delete(act)
+
+        # Delete Study Sessions
+        study_sessions = session.exec(select(StudySession).where(StudySession.user_id == user_id)).all()
+        for s in study_sessions: session.delete(s)
+
+        # Delete Quests (even if unused in V1, good to clear if they exist)
+        quests = session.exec(select(Quest).where(Quest.user_id == user_id)).all()
+        for q in quests: session.delete(q)
+
+        # Delete Reminders
+        reminders = session.exec(select(Reminder).where(Reminder.user_id == user_id)).all()
+        for r in reminders: session.delete(r)
+
+        # Delete StudySets and their associated Flashcards
+        study_sets = session.exec(select(StudySet).where(StudySet.user_id == user_id)).all()
+        for s_set in study_sets:
+            # Delete flashcards linked to this set first to avoid orphan errors
+            cards = session.exec(select(Flashcard).where(Flashcard.set_id == s_set.id)).all()
+            for card in cards: session.delete(card)
+            session.delete(s_set)
+
+        # Delete Feedback
+        feedbacks = session.exec(select(Feedback).where(Feedback.user_id == user_id)).all()
+        for f in feedbacks: session.delete(f)
+
+        # 2. FINALLY, DELETE THE USER
         session.delete(current_user)
         session.commit()
+
         return {
             "message": "Account and all associated data successfully deleted",
         }
@@ -473,8 +506,5 @@ def delete_account(
         print(f"Failed to delete account: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Error deleting account. Did you remember to apply the "
-                "ON DELETE CASCADE migration to your database?"
-            ),
+            detail="Error deleting account data. Please contact support.",
         )
