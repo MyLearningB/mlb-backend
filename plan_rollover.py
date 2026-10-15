@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 
 from database import engine
 from models import StudyPlan, StudySession
-from ai_service import generate_deepseek_study_plan
+from ai_service import generate_gemini_study_plan
 
 
 ROLLOVER_LOOKAHEAD_DAYS = 3
@@ -135,10 +135,12 @@ async def extend_plan_window(plan_id: int) -> bool:
     if snapshot["deadline"]:
         days_remaining = max((snapshot["deadline"] - next_start).days, 0)
 
+ 
     # ------------------------------------------------------------
     # STEP 3 — AI call (no DB lock held)
     # ------------------------------------------------------------
-    window_data = await generate_deepseek_study_plan(
+    # Change the function name here:
+    window_data = await generate_gemini_study_plan(
         goal=snapshot["subject"],
         target_date=snapshot["deadline"],
         days_remaining=days_remaining,

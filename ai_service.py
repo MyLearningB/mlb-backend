@@ -9,13 +9,13 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "your-deepseek-api-key-here")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-gemini-api-key-here")
 
+# Point the OpenAI client to the Gemini API endpoint
 client = AsyncOpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com",
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
-
 
 # ==========================================
 # CANONICAL VALUES
@@ -109,11 +109,10 @@ PERSONA_HINTS = {
 # 1. AI SOLVE ENGINE
 # ==========================================
 
-async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
+async def generate_gemini_solution(question_text: str) -> Optional[dict]:
     """
-    Sends the user's question to DeepSeek and forces it to return
-    a highly structured JSON response matching our Flutter app's
-    expectations.
+    Sends the user's question to the Gemini API and forces it to return
+    a highly structured JSON response matching our Flutter app's expectations.
     """
 
     system_prompt = """
@@ -147,7 +146,7 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
 
     try:
         response = await client.chat.completions.create(
-            model="deepseek-chat",
+            model="gemini-1.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Solve this: {question_text}"},
@@ -198,7 +197,7 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
         return ai_data
 
     except Exception as e:
-        print(f"DeepSeek AI Solve Error: {e}")
+        print(f"Gemini AI Solve Error: {e}")
         traceback.print_exc()
         return None
 
@@ -206,19 +205,12 @@ async def generate_deepseek_solution(question_text: str) -> Optional[dict]:
 # ==========================================
 # 2. AI PHASE SKELETON GENERATOR
 # ==========================================
-#
-# Called once when a plan is created, and again at each phase
-# boundary if the arc is rebased. Produces 2–6 contiguous phases
-# that span the entire plan duration.
-#
-# Skipped entirely for spans <= 14 days — one window IS the plan.
 
 MIN_PHASE_WEEKS = 2
 MIN_PHASES = 2
 MAX_PHASES = 6
 
-
-async def generate_deepseek_phase_plan(
+async def generate_gemini_phase_plan(
     goal: str,
     goal_type: Optional[str],
     total_weeks: int,
@@ -228,9 +220,6 @@ async def generate_deepseek_phase_plan(
 ) -> Optional[dict]:
     """
     Generate a 2–6 phase skeleton spanning `total_weeks`.
-
-    `progress_summary` is None for the initial call, and a short
-    natural-language recap for rebases.
     """
 
     if total_weeks < MIN_PHASE_WEEKS:
@@ -307,7 +296,7 @@ async def generate_deepseek_phase_plan(
 
     try:
         response = await client.chat.completions.create(
-            model="deepseek-chat",
+            model="gemini-1.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -385,7 +374,7 @@ async def generate_deepseek_phase_plan(
         }
 
     except Exception as e:
-        print(f"DeepSeek Phase Plan Error: {e}")
+        print(f"Gemini Phase Plan Error: {e}")
         traceback.print_exc()
         return None
 
@@ -393,17 +382,12 @@ async def generate_deepseek_phase_plan(
 # ==========================================
 # 3. AI WINDOW GENERATOR
 # ==========================================
-#
-# Generates ONE window of sessions at a time. Called on plan
-# creation for the first window, and by plan_rollover.py for
-# every subsequent window.
 
-async def generate_deepseek_study_plan(
+async def generate_gemini_study_plan(
     goal: str,
     target_date: Optional[date] = None,
     days_remaining: Optional[int] = None,
     goal_type: Optional[str] = None,
-    # NEW
     window_start: Optional[date] = None,
     window_days: int = 7,
     phase_context: Optional[dict] = None,
@@ -415,9 +399,6 @@ async def generate_deepseek_study_plan(
 ) -> Optional[dict]:
     """
     Generate sessions for a single window (default 7 days).
-
-    Backwards-compatible: if `window_start` is None, defaults to
-    today, and the output shape is identical to the old 7-day plan.
     """
     if window_start is None:
         window_start = date.today()
@@ -425,7 +406,6 @@ async def generate_deepseek_study_plan(
     today_str = window_start.isoformat()
     window_end = window_start + timedelta(days=window_days - 1)
 
-    # ---- Deadline context ----
     if target_date and days_remaining is not None:
         context_prompt = (
             f"Their deadline is in {days_remaining} days "
@@ -438,13 +418,11 @@ async def generate_deepseek_study_plan(
             "Build a sustainable, consistent routine."
         )
 
-    # ---- Persona ----
     persona_block = PERSONA_HINTS.get(
         goal_type or "",
         "Keep sessions moderate length and balanced between theory and practice.",
     )
 
-    # ---- Phase context ----
     phase_block = ""
     if phase_context:
         focus_str = ", ".join(phase_context.get("focus", []))
@@ -458,7 +436,6 @@ async def generate_deepseek_study_plan(
         topics from future phases.
         """
 
-    # ---- History ----
     history_block = ""
     if recent_topics:
         history_block += (
@@ -476,7 +453,6 @@ async def generate_deepseek_study_plan(
     if pace_feedback:
         history_block += f"USER PACE FEEDBACK: {pace_feedback}\n"
 
-    # ---- Availability ----
     availability_block = ""
     if minutes_per_day and study_days_per_week:
         availability_block = (
@@ -526,7 +502,7 @@ async def generate_deepseek_study_plan(
 
     try:
         response = await client.chat.completions.create(
-            model="deepseek-chat",
+            model="gemini-1.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -549,7 +525,6 @@ async def generate_deepseek_study_plan(
 
             date_str = str(raw.get("date") or "").strip()
 
-            # Hard-bound: reject anything outside the requested window.
             try:
                 s_date = date.fromisoformat(date_str)
             except ValueError:
@@ -585,6 +560,6 @@ async def generate_deepseek_study_plan(
         return plan_data
 
     except Exception as e:
-        print(f"DeepSeek Window Plan Error: {e}")
+        print(f"Gemini Window Plan Error: {e}")
         traceback.print_exc()
         return None

@@ -12,17 +12,17 @@ from sqlmodel import Session, select, or_
 from typing import List, Optional
 
 # Import your schemas and models
-from schemas import CanvasCreate, CanvasResponse, CanvasStatusResponse, NodeCreate, NodeResponse
+from schemas import CanvasCreate, CanvasResponse, CanvasStatusResponse, NodeCreate, NodeResponse, NodeUpdate
 from models import Canvas, CanvasNode, CanvasConnection, CanvasSourceType, Collection, CollectionAccess, CollectionItem, Note, User
 from security import get_current_user
 from database import get_session, engine  # FIXED: Imported engine for the background task
 
 router = APIRouter(tags=["Canvas Section"])
 
-# FIXED: Initialize the Synchronous DeepSeek Client
-deepseek_client = OpenAI(
-    api_key=os.environ.get("DEEPSEEK_API_KEY"), 
-    base_url="https://api.deepseek.com"
+# FIXED: Initialize the Synchronous Gemini Client
+gemini_client = OpenAI(
+    api_key=os.environ.get("GEMINI_API_KEY"), 
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
 # ==========================================
@@ -58,7 +58,7 @@ def extract_text_from_file(file: UploadFile) -> str:
 
 # FIXED: Made synchronous and handles its own independent DB session
 def process_note_to_canvas_bg(canvas_id: uuid.UUID, note_content: str):
-    print(f"Starting DeepSeek processing for canvas {canvas_id}...")
+    print(f"Starting Gemini processing for canvas {canvas_id}...")
     
     with Session(engine) as db:
         canvas = db.exec(select(Canvas).where(Canvas.id == canvas_id)).first()
@@ -87,8 +87,8 @@ def process_note_to_canvas_bg(canvas_id: uuid.UUID, note_content: str):
         """
 
         try:
-            response = deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+            response = gemini_client.chat.completions.create(
+                model="gemini-1.5-flash",
                 messages=[
                     {"role": "system", "content": "You are an API that only returns valid JSON."},
                     {"role": "user", "content": prompt}
@@ -99,7 +99,7 @@ def process_note_to_canvas_bg(canvas_id: uuid.UUID, note_content: str):
             ai_data = json.loads(response.choices[0].message.content)
             
         except Exception as e:
-            print(f"DeepSeek Error: {e}")
+            print(f"Gemini Error: {e}")
             return
 
         G = nx.Graph()

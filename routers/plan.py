@@ -40,8 +40,8 @@ from schemas import (
 )
 from security import get_current_user
 from ai_service import (
-    generate_deepseek_phase_plan,
-    generate_deepseek_study_plan,
+    generate_gemini_phase_plan,
+    generate_gemini_study_plan,
 )
 from routers.auth import limiter
 from utils import (
@@ -406,7 +406,7 @@ async def generate_study_plan(
 
     phase_data = None
     if total_wk >= 2:
-        phase_data = await generate_deepseek_phase_plan(
+        phase_data = await generate_gemini_phase_plan(
             goal=payload.goal,
             goal_type=resolved_goal_type,
             total_weeks=total_wk,
@@ -420,7 +420,7 @@ async def generate_study_plan(
         else None
     )
 
-    window_data = await generate_deepseek_study_plan(
+    window_data = await generate_gemini_study_plan(
         goal=payload.goal,
         target_date=payload.deadline,
         days_remaining=days_remaining,

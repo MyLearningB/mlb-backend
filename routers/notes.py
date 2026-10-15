@@ -15,10 +15,10 @@ from models import CollectionAccess, CollectionItem, Collection, User, Note, Fla
 
 router = APIRouter(tags=["Notes Section"])
 
-# FIXED: Initialized Synchronous DeepSeek Client
-deepseek_client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY", "your-deepseek-api-key"),
-    base_url="https://api.deepseek.com"
+# FIXED: Initialized Synchronous Gemini Client
+gemini_client = OpenAI(
+    api_key=os.getenv("GEMINI_API_KEY", "your-gemini-api-key"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
 # ==========================================
@@ -58,7 +58,7 @@ def calculate_note_metadata(text: str):
 
 # FIXED: Changed to sync `def` and handles its own DB session
 def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions):
-    print(f"Starting DeepSeek flashcard generation for note {note_id}...")
+    print(f"Starting Gemini flashcard generation for note {note_id}...")
     
     # Background task MUST open its own session, independent of the HTTP request
     with Session(engine) as db:
@@ -93,8 +93,8 @@ def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions)
 
         try:
             # FIXED: Removed await, using sync client
-            response = deepseek_client.chat.completions.create(
-                model="deepseek-chat",
+            response = gemini_client.chat.completions.create(
+                model="gemini-1.5-flash",
                 messages=[
                     {"role": "system", "content": "You are an API that only returns valid JSON."},
                     {"role": "user", "content": prompt}
@@ -138,7 +138,7 @@ def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions)
             print(f"Successfully generated {len(cards_data)} cards for note {note_id}")
 
         except Exception as e:
-            print(f"DeepSeek Error generating cards: {e}")
+            print(f"Gemini Error generating cards: {e}")
 
 # ==========================================
 # 1. GET ALL NOTES

@@ -74,7 +74,7 @@ from schemas import (
 # AI SERVICE
 # ============================================================
 
-from ai_service import generate_deepseek_solution
+from ai_service import generate_gemini_solution
 
 # ============================================================
 # ROLLOVER
@@ -581,7 +581,6 @@ def get_dashboard(
 # ============================================================
 # AI SOLVE
 # ============================================================
-
 @app.post(
     "/solve",
     response_model=SolveResponse,
@@ -599,7 +598,8 @@ async def solve_question(
             detail="Please provide a question_text.",
         )
 
-    solution_data = await generate_deepseek_solution(payload.question_text)
+    # Use the new Gemini function here
+    solution_data = await generate_gemini_solution(payload.question_text)
 
     if not solution_data:
         raise HTTPException(

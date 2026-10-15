@@ -397,7 +397,7 @@ class Quest(SQLModel, table=True):
 #                     Shrinks to fit if the deadline is tighter
 #                     than a week.
 #   * phase_plan    : JSON blob of PhasePlan (see schemas.py).
-#                     Produced by generate_deepseek_phase_plan.
+#                     Produced by generate_gemini_phase_plan.
 #                     Contains 2–6 contiguous phases spanning the
 #                     whole duration. Null for spans < 2 weeks.
 #   * arc_version   : bumped whenever the arc is rebased, so we

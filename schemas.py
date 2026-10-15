@@ -269,7 +269,7 @@ class Nudge(BaseModel):
 # ==========================================
 
 class PlanPhase(BaseModel):
-    """A contiguous stretch of the arc (see generate_deepseek_phase_plan)."""
+    """A contiguous stretch of the arc (see generate_gemini_phase_plan)."""
     name: str
     start_week: int = Field(..., ge=1)
     end_week: int = Field(..., ge=1)

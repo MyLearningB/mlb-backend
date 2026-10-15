@@ -28,17 +28,18 @@ load_dotenv()
 
 router = APIRouter(prefix="/study", tags=["Study Tab"])
 
+# Repoint the OpenAI client to Gemini's compatibility endpoint
 client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY", "fallback-key-for-dev"),
-    base_url="https://api.deepseek.com"
+    api_key=os.getenv("GEMINI_API_KEY", "fallback-key-for-dev"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
 # ==========================================
 # UPLOAD LIMITS
 # ==========================================
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024           # 5 MB hard cap
-MAX_EXTRACTED_CHARS = 25000                  # ~6k tokens going to DeepSeek
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024          # 5 MB hard cap
+MAX_EXTRACTED_CHARS = 25000                  # ~6k tokens going to Gemini
 MAX_TITLE_LEN = 60
 MAX_SUBJECT_LEN = 40
 
@@ -247,9 +248,9 @@ def upload_and_generate_study_set(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session)
 ):
-    """Takes a raw PDF/DOCX/TXT, extracts the text, and commands DeepSeek to turn it into flashcards.
+    """Takes a raw PDF/DOCX/TXT, extracts the text, and commands Gemini to turn it into flashcards.
 
-    Synchronous: DeepSeek runs inside the request. The client
+    Synchronous: Gemini runs inside the request. The client
     has a 90s timeout to accommodate cold starts and 5MB docs.
     """
 
@@ -262,7 +263,7 @@ def upload_and_generate_study_set(
             detail="Could not extract enough readable text from this file.",
         )
 
-    # Guardrail: Cap the text sent to DeepSeek
+    # Guardrail: Cap the text sent to Gemini
     if len(raw_text) > MAX_EXTRACTED_CHARS:
         raw_text = raw_text[:MAX_EXTRACTED_CHARS]
 
@@ -289,7 +290,7 @@ def upload_and_generate_study_set(
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model="gemini-1.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Here is the source text:\n\n{raw_text}"}
@@ -311,7 +312,7 @@ def upload_and_generate_study_set(
         # Let our own HTTP errors (e.g. 400 from size check) bubble up
         raise
     except Exception as e:
-        print(f"DeepSeek Parsing Error: {e}")
+        print(f"Gemini Parsing Error: {e}")
         raise HTTPException(
             status_code=500,
             detail="The AI couldn't parse the concepts out of this document. Try a cleaner PDF."
@@ -594,7 +595,7 @@ def feynman_chat_message(
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model="gemini-1.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_input}
@@ -624,7 +625,7 @@ def feynman_chat_message(
         }
 
     except Exception as e:
-        print(f"DeepSeek Feynman Error: {e}")
+        print(f"Gemini Feynman Error: {e}")
         raise HTTPException(
             status_code=500,
             detail="AI failed to process the response. Please try again."
