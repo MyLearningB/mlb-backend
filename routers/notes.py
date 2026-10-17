@@ -94,7 +94,7 @@ def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions)
         try:
             # FIXED: Removed await, using sync client
             response = gemini_client.chat.completions.create(
-                model="gemini-1.5-flash",
+                 model="gemini-3.8-flash",
                 messages=[
                     {"role": "system", "content": "You are an API that only returns valid JSON."},
                     {"role": "user", "content": prompt}

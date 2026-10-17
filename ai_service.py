@@ -146,7 +146,7 @@ async def generate_gemini_solution(question_text: str) -> Optional[dict]:
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.0-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Solve this: {question_text}"},
@@ -296,7 +296,7 @@ async def generate_gemini_phase_plan(
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.0-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -502,7 +502,7 @@ async def generate_gemini_study_plan(
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-2.0-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
