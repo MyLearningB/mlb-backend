@@ -88,7 +88,7 @@ def process_note_to_canvas_bg(canvas_id: uuid.UUID, note_content: str):
 
         try:
             response = gemini_client.chat.completions.create(
-                model="gemini-1.5-flash",
+                model="gemini-2.0-flash",
                 messages=[
                     {"role": "system", "content": "You are an API that only returns valid JSON."},
                     {"role": "user", "content": prompt}
