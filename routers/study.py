@@ -290,7 +290,7 @@ def upload_and_generate_study_set(
 
     try:
         response = client.chat.completions.create(
-            model="gemini-1.5-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Here is the source text:\n\n{raw_text}"}
@@ -595,7 +595,7 @@ def feynman_chat_message(
 
     try:
         response = client.chat.completions.create(
-            model="gemini-1.5-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_input}
