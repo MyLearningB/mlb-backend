@@ -1,8 +1,9 @@
 import uuid
 import json
-import networkx as nx
 import os
 import io
+import math
+
 from pypdf import PdfReader
 import docx
 from httpx import Timeout
@@ -26,13 +27,8 @@ from database import get_session, engine
 router = APIRouter(tags=["Canvas Section"])
 
 # ==========================================
-# GEMINI CLIENT — BOUNDED TIMEOUT IS THE FIX
+# GEMINI CLIENT — BOUNDED TIMEOUT
 # ==========================================
-# Previously: no timeout → chat.completions.create() can hang forever
-# when Gemini is slow / rate-limited / the network blips mid-response.
-# That's exactly what your log showed: task started, no error, no exit,
-# canvas stuck at 0 nodes.
-#
 # timeout=Timeout(60.0, connect=10.0):
 #   * 10 s to establish the TCP/TLS connection
 #   * 60 s total for the request (headers + body streaming)
@@ -54,7 +50,7 @@ def extract_text_from_file(file: UploadFile) -> str:
     """Reads PDF, DOCX, or TXT directly from memory without saving to disk."""
     content = file.file.read()
 
-    # FIXED: `file.filename` can be None on some Android providers.
+    # `file.filename` can be None on some Android providers.
     filename = (file.filename or "").lower()
     text = ""
 
@@ -77,7 +73,7 @@ def extract_text_from_file(file: UploadFile) -> str:
                 detail="Unsupported file format. Use PDF, DOCX, or TXT.",
             )
     except HTTPException:
-        # FIXED: don't re-wrap our own 400 as a 500
+        # don't re-wrap our own 400 as a 500
         raise
     except Exception as e:
         raise HTTPException(
@@ -155,8 +151,7 @@ def process_note_to_canvas_bg(canvas_id: uuid.UUID, note_content: str):
                 f"[canvas-bg] AI FAILURE canvas={canvas_id}: "
                 f"{type(e).__name__}: {e}"
             )
-            # node_count stays at 0 → client will treat this as failed
-            # after its 90s polling window.
+            # node_count stays at 0 → client treats as failed after 90 s
             return
 
         # ---------- PHASE 2: BUILD & PERSIST ----------
@@ -212,6 +207,8 @@ def _persist_canvas_from_ai_data(
     """
     All dict access is .get()-based. No KeyError, no TypeError on
     None labels, no node-id collisions with "hero".
+    Layout is a deterministic radial hub-and-spoke — no numpy,
+    no randomness, no networkx.
     """
     raw_concepts = ai_data.get("concepts") or []
     raw_rels = ai_data.get("relationships") or []
@@ -239,22 +236,53 @@ def _persist_canvas_from_ai_data(
             "definition": c.get("definition"),
         })
 
-    # --- Build the graph (only edges between known ids) ---
-    G = nx.Graph()
-    G.add_node("hero")
+    # --- Build adjacency dict (only edges between known ids) ---
+    adjacency = {"hero": set()}
     for c in safe_concepts:
-        G.add_node(c["id"])
+        adjacency[c["id"]] = set()
     for rel in raw_rels:
         if not isinstance(rel, dict):
             continue
         a = rel.get("from_id")
         b = rel.get("to_id")
-        if a in G.nodes and b in G.nodes and a != b:
-            G.add_edge(a, b)
+        if a in adjacency and b in adjacency and a != b:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
 
-    positions = nx.spring_layout(
-        G, center=(1500, 1500), scale=600, seed=42
-    )
+    # ---------------------------------------------
+    # RADIAL LAYOUT (no numpy, no randomness)
+    # ---------------------------------------------
+    # Hero sits at the centre. Concepts are placed on concentric
+    # rings of up to 6 nodes each. Ring 0 at radius 320, ring 1 at
+    # 540, ring 2 at 760, etc. Each ring is rotated by half a step
+    # so nodes don't visually stack radially.
+    #
+    # Why this beats nx.spring_layout here:
+    #   * no numpy dependency (numpy is not on Render — that was the
+    #     ModuleNotFoundError that was killing this task)
+    #   * deterministic (same doc → same map)
+    #   * actually reads as a mind map instead of a random blob
+    #   * O(n), instantaneous — no force simulation
+    positions = {"hero": (1500.0, 1500.0)}
+    per_ring = 6
+    total_concepts = len(safe_concepts)
+    for i, concept in enumerate(safe_concepts):
+        ring = i // per_ring
+        idx_in_ring = i % per_ring
+        ring_count = min(per_ring, total_concepts - ring * per_ring)
+        if ring_count <= 0:
+            ring_count = 1
+        radius = 320.0 + ring * 220.0
+        angle_offset = ring * (math.pi / per_ring)
+        angle = (
+            (2 * math.pi * idx_in_ring / ring_count)
+            + angle_offset
+            - (math.pi / 2)
+        )
+        positions[concept["id"]] = (
+            1500.0 + radius * math.cos(angle),
+            1500.0 + radius * math.sin(angle),
+        )
 
     # --- Hero node ---
     hero_uuid = uuid.uuid4()
@@ -390,7 +418,7 @@ def create_canvas_from_file(
         user_id=current_user.id,
         name=name,
         subject=subject,
-        # FIXED: was CanvasSourceType.manual — that made uploads
+        # was CanvasSourceType.manual — that made uploads
         # indistinguishable from intentional empty manual canvases,
         # so the client couldn't tell "still AI-ing" from "done".
         source_type=CanvasSourceType.upload,
