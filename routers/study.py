@@ -3,11 +3,11 @@ import io
 import os
 import json
 import uuid
-from typing import List, Optional
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Header
+from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlmodel import Session, select, or_
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -16,7 +16,10 @@ from openai import OpenAI
 # Database, Models, Authentication, and Helpers
 from database import get_session
 from security import get_current_user
-from models import User, StudySet, Flashcard, FeynmanSession, DailyActivity, Pet, Collection, CollectionItem, CollectionAccess
+from models import (
+    User, StudySet, Flashcard, FeynmanSession,
+    DailyActivity, Pet, Collection, CollectionItem, CollectionAccess,
+)
 
 # ✨ IMPORT THE STREAK HELPER ✨
 from routers.profile import update_user_streak
@@ -37,6 +40,11 @@ client = OpenAI(
 # ==========================================
 # UPLOAD LIMITS
 # ==========================================
+#
+# These are SHARED with routers/notes.py — the upload endpoint
+# there imports extract_text_from_file + these constants so the
+# 5MB / 25k-char guardrails are enforced consistently across
+# every ingestion path.
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024          # 5 MB hard cap
 MAX_EXTRACTED_CHARS = 25000                  # ~6k tokens going to Gemini
@@ -84,11 +92,15 @@ def get_local_now(timezone_str: str = "UTC") -> datetime:
     return datetime.now(tz)
 
 
-def extract_text_from_file(file: UploadFile) -> str:
+def extract_text_from_file(file) -> str:
     """Reads uploaded files directly from RAM without hitting the disk.
 
     Enforces MAX_UPLOAD_BYTES BEFORE parsing, so a malicious or
     accidental 100MB upload can't blow up the container.
+
+    NOTE: `file` is typed loosely as `Any` here so this module
+    doesn't need to import `fastapi.UploadFile`. The caller
+    (routers/notes.py) passes a real UploadFile.
     """
     content = file.file.read()
     filename = (file.filename or "").lower()
@@ -236,121 +248,6 @@ def delete_study_set(
     db.commit()
 
     return {"message": "Study set and all associated data deleted successfully"}
-
-
-# ========================================================
-# ✨ 6C: AI DOCUMENT UPLOAD & EXTRACTION ENDPOINT ✨
-# ========================================================
-
-@router.post("/upload", status_code=201)
-def upload_and_generate_study_set(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_session)
-):
-    """Takes a raw PDF/DOCX/TXT, extracts the text, and commands Gemini to turn it into flashcards.
-
-    Synchronous: Gemini runs inside the request. The client
-    has a 90s timeout to accommodate cold starts and 5MB docs.
-    """
-
-    # 1. Extract raw text from the uploaded binary (with size guard)
-    raw_text = extract_text_from_file(file)
-
-    if not raw_text or len(raw_text.strip()) < 30:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract enough readable text from this file.",
-        )
-
-    # Guardrail: Cap the text sent to Gemini
-    if len(raw_text) > MAX_EXTRACTED_CHARS:
-        raw_text = raw_text[:MAX_EXTRACTED_CHARS]
-
-    system_prompt = """
-    You are an expert AI professor. Your job is to read the provided text and turn it into a high-yield study set.
-
-    Analyze the text and output ONLY valid JSON matching this exact schema:
-    {
-      "title": "A short, engaging title for the deck (max 5 words)",
-      "subject": "The academic subject (e.g. Biology, Macroeconomics, Literature, or General)",
-      "flashcards": [
-        {
-          "question": "Clear, direct conceptual question",
-          "answer": "Concise, highly accurate technical answer"
-        }
-      ]
-    }
-
-    Rules:
-    - Generate between 6 and 15 flashcards depending on the document's density.
-    - Focus on core concepts, definitions, formulas, or pivotal relationships.
-    - Do not include markdown wrappers around the JSON.
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Here is the source text:\n\n{raw_text}"}
-            ],
-            response_format={"type": "json_object"}
-        )
-
-        ai_data = json.loads(response.choices[0].message.content)
-
-        fallback_title = (file.filename or "Untitled").rsplit(".", 1)[0]
-        deck_title = (ai_data.get("title") or fallback_title)[:MAX_TITLE_LEN]
-        deck_subject = (ai_data.get("subject") or "General")[:MAX_SUBJECT_LEN]
-        generated_cards = ai_data.get("flashcards", [])
-
-        if not generated_cards:
-            raise ValueError("LLM returned an empty flashcards array.")
-
-    except HTTPException:
-        # Let our own HTTP errors (e.g. 400 from size check) bubble up
-        raise
-    except Exception as e:
-        print(f"Gemini Parsing Error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="The AI couldn't parse the concepts out of this document. Try a cleaner PDF."
-        )
-
-    # 2. Save the new parent StudySet to the DB.
-    # `last_studied` is intentionally left None — it should reflect
-    # real study activity, not upload time.
-    new_study_set = StudySet(
-        user_id=current_user.id,
-        title=deck_title,
-        subject=deck_subject,
-        card_count=len(generated_cards),
-        weak_cards_count=0,
-    )
-    db.add(new_study_set)
-    db.commit()
-    db.refresh(new_study_set)
-
-    # 3. Save all children Flashcards attached to that set
-    for card_data in generated_cards:
-        new_card = Flashcard(
-            study_set_id=new_study_set.id,
-            question=card_data.get("question", "Undefined Question"),
-            answer=card_data.get("answer", "Undefined Answer"),
-            subject=deck_subject,
-            is_weak=False
-        )
-        db.add(new_card)
-
-    db.commit()
-
-    return {
-        "id": new_study_set.id,
-        "title": new_study_set.title,
-        "card_count": new_study_set.card_count,
-        "status": "success"
-    }
 
 
 # ==========================================
