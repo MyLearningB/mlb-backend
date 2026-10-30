@@ -11,13 +11,10 @@ import json
 import os
 from openai import OpenAI
 
-# Database, Models, and Authentication
 from database import get_session, engine
 from security import get_current_user
 from models import CollectionAccess, CollectionItem, Collection, User, Note, Flashcard, StudySet
 
-# Reuse the file-extraction guardrails from study.py so a 5MB cap
-# and PDF/DOCX/TXT parsing aren't duplicated.
 from routers.study import (
     extract_text_from_file,
     MAX_EXTRACTED_CHARS,
@@ -66,6 +63,45 @@ def calculate_note_metadata(text: str):
     word_count = len(text.split()) if text else 0
     snippet = text[:77] + "..." if len(text) > 80 else text
     return word_count, snippet
+
+
+def enrich_note_metadata(note_id: int, sample_text: str):
+    """Ask Gemini for a nicer title/subject and patch the note.
+
+    Runs in the background AFTER the upload response has already
+    returned, so the client isn't blocked on Gemini's cold-start.
+    If this fails, the note still exists with the filename title.
+    """
+    with Session(engine) as db:
+        note = db.get(Note, note_id)
+        if not note:
+            return
+        try:
+            system_prompt = """
+            You are analyzing a study document. Return ONLY valid JSON matching:
+            {"title": "short engaging title, max 6 words", "subject": "academic subject or General"}
+            No markdown. Just raw JSON.
+            """
+            response = gemini_client.chat.completions.create(
+                model="gemini-3.8-flash",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": sample_text},
+                ],
+                response_format={"type": "json_object"},
+            )
+            ai_data = json.loads(response.choices[0].message.content)
+            if ai_data.get("title"):
+                note.title = ai_data["title"][:MAX_TITLE_LEN]
+            if ai_data.get("subject"):
+                note.subject = ai_data["subject"][:MAX_SUBJECT_LEN]
+            note.updated_at = datetime.now(timezone.utc)
+            db.add(note)
+            db.commit()
+            print(f"Enriched note {note_id}: {note.title!r} / {note.subject!r}")
+        except Exception as e:
+            print(f"Note enrichment failed (non-fatal): {e}")
+
 
 def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions):
     print(f"Starting Gemini flashcard generation for note {note_id}...")
@@ -148,6 +184,7 @@ def generate_cards_bg(note_id: int, user_id: int, options: GenerateCardsOptions)
         except Exception as e:
             print(f"Gemini Error generating cards: {e}")
 
+
 # ==========================================
 # 1. GET ALL NOTES
 # ==========================================
@@ -189,26 +226,24 @@ def get_all_notes(
         "has_more": total_count > (offset + limit),
     }
 
+
 # ==========================================
-# 1B. UPLOAD DOCUMENT → CREATE NOTE
+# 1B. UPLOAD DOCUMENT → CREATE NOTE  (FAST)
 # ==========================================
 @router.post("/notes/upload", status_code=status.HTTP_201_CREATED)
 def upload_document_as_note(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
 ):
     """
-    Upload PDF/DOCX/TXT → extract text → persist as a Note.
+    Upload PDF/DOCX/TXT → extract text → save as Note → return.
 
-    Flow:
-      1. Extract + size-guard via the shared helper in study.py
-      2. Ask Gemini for a short title + subject (best-effort, non-fatal)
-      3. Save a Note — NOT a StudySet
-      4. Client can then call POST /notes/{id}/generate-cards
-
-    Everything downstream (generate-cards, editor, delete) works
-    unchanged because we're writing to the same Note model.
+    Speed matters here: the note is created SYNCHRONOUSLY with the
+    filename as its title (2-4s total, mostly file parsing). A nicer
+    AI-generated title/subject is applied in the BACKGROUND so users
+    aren't stuck staring at a spinner for 30-60s on Gemini cold starts.
     """
     raw_text = extract_text_from_file(file)
 
@@ -223,35 +258,13 @@ def upload_document_as_note(
 
     fallback_title = (file.filename or "Untitled").rsplit(".", 1)[0]
     deck_title = fallback_title[:MAX_TITLE_LEN]
-    deck_subject = "General"
-
-    # Best-effort title/subject suggestion. Never blocks the upload.
-    try:
-        system_prompt = """
-        You are analyzing a study document. Return ONLY valid JSON matching:
-        {"title": "short engaging title, max 6 words", "subject": "academic subject or General"}
-        No markdown. Just raw JSON.
-        """
-        response = gemini_client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": raw_text[:3000]},  # classification sample
-            ],
-            response_format={"type": "json_object"},
-        )
-        ai_data = json.loads(response.choices[0].message.content)
-        deck_title = (ai_data.get("title") or fallback_title)[:MAX_TITLE_LEN]
-        deck_subject = (ai_data.get("subject") or "General")[:MAX_SUBJECT_LEN]
-    except Exception as e:
-        print(f"AI title/subject suggestion failed, using filename: {e}")
 
     word_count, snippet = calculate_note_metadata(raw_text)
 
     new_note = Note(
         user_id=current_user.id,
         title=deck_title,
-        subject=deck_subject,
+        subject="General",  # upgraded by background task
         content_text=raw_text,
         word_count=word_count,
         snippet=snippet,
@@ -260,6 +273,13 @@ def upload_document_as_note(
     db.commit()
     db.refresh(new_note)
 
+    # Fire-and-forget AI title enrichment.
+    background_tasks.add_task(
+        enrich_note_metadata,
+        new_note.id,
+        raw_text[:3000],
+    )
+
     return {
         "note_id": new_note.id,
         "title": new_note.title,
@@ -267,6 +287,7 @@ def upload_document_as_note(
         "word_count": word_count,
         "status": "success",
     }
+
 
 # ==========================================
 # 2. CREATE NOTE
@@ -292,6 +313,7 @@ def create_note(
     db.commit()
     db.refresh(new_note)
     return {"note_id": new_note.id, "created_at": new_note.created_at}
+
 
 # ==========================================
 # 3. GET NOTE DETAIL
@@ -336,6 +358,7 @@ def get_note(
     response_data["is_owner"] = is_owner
     return response_data
 
+
 # ==========================================
 # 4. UPDATE NOTE
 # ==========================================
@@ -362,6 +385,7 @@ def update_note(
     db.commit()
     return {"note_id": note.id, "updated_at": note.updated_at}
 
+
 # ==========================================
 # 5. DELETE NOTE
 # ==========================================
@@ -385,6 +409,7 @@ def delete_note(
     db.commit()
     return {"message": "Note and its flashcards deleted successfully"}
 
+
 # ==========================================
 # 6. GENERATE CARDS (AI)
 # ==========================================
@@ -402,9 +427,6 @@ def generate_cards(
 
     estimated_cards = max(1, note.word_count // 60)
 
-    # Create the parent StudySet synchronously so we can return its real
-    # ID. The background task then just appends cards to it, and the
-    # client polls GET /study/sets until card_count > 0.
     study_set = db.exec(
         select(StudySet).where(StudySet.title == f"Set: {note.title}")
     ).first()
@@ -432,6 +454,7 @@ def generate_cards(
         "card_count": study_set.card_count,
         "estimated_cards": estimated_cards,
     }
+
 
 # ==========================================
 # 7. MANUALLY ADD CARD FROM HIGHLIGHT
@@ -473,6 +496,7 @@ def add_manual_card(
     note.card_count += 1
     db.commit()
     return {"message": "Card added to set successfully"}
+
 
 # ==========================================
 # 8. GET ALL CARDS FOR A NOTE
