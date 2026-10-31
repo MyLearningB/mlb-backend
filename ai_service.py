@@ -17,6 +17,7 @@ client = AsyncOpenAI(
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
+
 # ==========================================
 # CANONICAL VALUES
 # ==========================================
@@ -210,6 +211,7 @@ MIN_PHASE_WEEKS = 2
 MIN_PHASES = 2
 MAX_PHASES = 6
 
+
 async def generate_gemini_phase_plan(
     goal: str,
     goal_type: Optional[str],
@@ -380,7 +382,7 @@ async def generate_gemini_phase_plan(
 
 
 # ==========================================
-# 3. AI WINDOW GENERATOR
+# 3. AI WINDOW GENERATOR (LEGACY single-subject)
 # ==========================================
 
 async def generate_gemini_study_plan(
@@ -563,3 +565,266 @@ async def generate_gemini_study_plan(
         print(f"Gemini Window Plan Error: {e}")
         traceback.print_exc()
         return None
+
+
+# ==========================================
+# 4. MULTI-SUBJECT WINDOW GENERATOR
+# ==========================================
+
+async def generate_gemini_multisubject_plan(
+    subjects: List[dict],
+    plan_title: str,
+    plan_type: str,
+    goal_type: Optional[str],
+    window_start: date,
+    window_days: int,
+    minutes_per_day: int,
+    study_days_per_week: int,
+    earliest: str = "07:00",
+    latest: str = "22:00",
+    session_length_pref: int = 45,
+    phase_context: Optional[dict] = None,
+    notes: Optional[str] = None,
+    recent_topics: Optional[List[str]] = None,
+) -> Optional[dict]:
+    """
+    Schedule a rolling window across N subjects.
+
+    Allocates minutes by:
+      * subject weight (1–5)
+      * exam proximity (escalates hard inside 14 days)
+      * presence of weak_topics (those get weak_area priority
+        and appear early in each block)
+      * total budget: minutes_per_day * study_days_per_week
+    """
+    window_end = window_start + timedelta(days=window_days - 1)
+
+    persona = PERSONA_HINTS.get(
+        goal_type or "",
+        "Keep sessions moderate and balance theory with practice.",
+    )
+
+    subject_lines = []
+    for s in subjects:
+        line = (
+            f"- {s['name']} (weight {s['weight']}/5, "
+            f"level {s['current_level']}"
+        )
+        if s.get("exam_date"):
+            line += f", exam {s['exam_date']}"
+        if s.get("topics"):
+            line += f", topics: {', '.join(s['topics'][:8])}"
+        if s.get("weak_topics"):
+            line += f", WEAK: {', '.join(s['weak_topics'][:6])}"
+        line += ")"
+        subject_lines.append(line)
+
+    phase_block = ""
+    if phase_context:
+        phase_block = (
+            f"CURRENT PHASE: {phase_context.get('name', '')} — "
+            f"focus {', '.join(phase_context.get('focus', []))}"
+        )
+
+    history_block = ""
+    if recent_topics:
+        history_block = (
+            "RECENT TOPICS (do not repeat unless a review):\n"
+            + "\n".join(f"  - {t}" for t in recent_topics[:20])
+        )
+
+    notes_block = f"USER NOTES: {notes}\n" if notes else ""
+
+    system_prompt = f"""You are myLB AI, an expert academic scheduler.
+
+Plan: "{plan_title}" (type: {plan_type}).
+Window: {window_start.isoformat()} -> {window_end.isoformat()} ({window_days} days).
+Today is {window_start.isoformat()}.
+Budget: {minutes_per_day} min/day, {study_days_per_week} days/week.
+Time-of-day window: {earliest}-{latest}. Prefer {session_length_pref}-min sessions.
+
+LEARNER PROFILE:
+{persona}
+
+SUBJECTS:
+{chr(10).join(subject_lines)}
+
+{phase_block}
+{history_block}
+{notes_block}
+
+SCHEDULING RULES - these are mandatory:
+1. Distribute sessions across ALL subjects each week - no subject
+   may go more than 3 days without a session unless its exam is
+   >45 days away.
+2. Higher weight -> more minutes. Weight 5 should get roughly 3x
+   the minutes of weight 1.
+3. Exam within 14 days -> double that subject's baseline minutes.
+   Exam within 7 days -> triple.
+4. Topics listed in WEAK for a subject get priority="weak_area"
+   and appear in the first half of each block for that subject.
+5. Respect the budget: {minutes_per_day} min * {study_days_per_week}
+   days / week. Do NOT exceed total weekly minutes.
+6. Rest days are fine - mark them by omitting sessions, not by
+   adding a "rest" session.
+7. Never repeat a topic already in RECENT TOPICS unless marked
+   mode="review".
+8. Sessions must start within {earliest}-{latest}.
+
+RESPOND IN VALID JSON - no markdown, no prose:
+{{
+  "sessions": [
+    {{
+      "date": "YYYY-MM-DD",
+      "time": "HH:MM",
+      "subject_name": "must exactly match one of the subject names above",
+      "topic": "specific sub-topic to study",
+      "duration_mins": 45,
+      "mode": "review" | "flashcard" | "feynman",
+      "priority": "normal" | "high" | "weak_area"
+    }}
+  ]
+}}
+"""
+
+    try:
+        response = await client.chat.completions.create(
+            model="gemini-3.8-flash",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"Schedule my next {window_days} days.",
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.6,
+        )
+        data = json.loads(response.choices[0].message.content)
+
+        if not isinstance(data.get("sessions"), list):
+            return None
+
+        valid_names = {s["name"] for s in subjects}
+        clean = []
+        for raw in data["sessions"]:
+            if not isinstance(raw, dict):
+                continue
+
+            try:
+                s_date = date.fromisoformat(str(raw.get("date", "")))
+            except (ValueError, TypeError):
+                continue
+            if not (window_start <= s_date <= window_end):
+                continue
+
+            name = str(raw.get("subject_name", "")).strip()
+            if name not in valid_names:
+                name = next(
+                    (v for v in valid_names if v.lower() in name.lower()),
+                    subjects[0]["name"] if subjects else "",
+                )
+            if not name:
+                continue
+
+            try:
+                dur = int(raw.get("duration_mins") or session_length_pref)
+            except (TypeError, ValueError):
+                dur = session_length_pref
+            dur = max(10, min(dur, 180))
+
+            clean.append(
+                {
+                    "date": s_date.isoformat(),
+                    "time": str(raw.get("time") or "16:00"),
+                    "subject_name": name,
+                    "topic": (
+                        str(raw.get("topic") or "").strip() or None
+                    ),
+                    "duration_mins": dur,
+                    "mode": _normalize_mode(raw.get("mode")),
+                    "priority": _normalize_priority(raw.get("priority")),
+                }
+            )
+
+        return {"sessions": clean}
+
+    except Exception as e:
+        print(f"Gemini Multi-Subject Plan Error: {e}")
+        traceback.print_exc()
+        return None
+
+
+# ==========================================
+# 5. DETERMINISTIC FALLBACK SCHEDULER
+# ==========================================
+#
+# If the AI fails twice, we still owe the user a plan they can
+# edit. This builds a reasonable round-robin schedule that:
+#
+#   * respects minutes_per_day and study_days_per_week
+#   * prioritises subjects by (exam proximity + weight)
+#   * tags weak_area priority when the subject has weak_topics
+#   * never generates overlapping times on the same day
+
+def build_fallback_schedule(
+    subjects: List[dict],
+    window_start: date,
+    window_days: int,
+    minutes_per_day: int,
+    study_days_per_week: int,
+    session_length_pref: int = 45,
+) -> dict:
+    sessions: List[dict] = []
+    if not subjects:
+        return {"sessions": sessions}
+
+    def urgency(s: dict) -> float:
+        weight_score = s.get("weight", 3) * 5.0
+        if s.get("exam_date"):
+            try:
+                days = (s["exam_date"] - window_start).days
+            except TypeError:
+                days = 60
+            if days <= 0:
+                return 1000.0  # already past — put at front
+            proximity = max(0, 60 - min(days, 60)) * 2.0
+            return weight_score + proximity
+        return weight_score
+
+    ranked = sorted(subjects, key=urgency, reverse=True)
+    idx = 0
+
+    for offset in range(window_days):
+        # Honour study_days_per_week by skipping rest days.
+        if study_days_per_week < 7 and offset % 7 >= study_days_per_week:
+            continue
+
+        day = window_start + timedelta(days=offset)
+        remaining = minutes_per_day
+        hour = 16
+
+        while remaining >= max(20, session_length_pref // 2):
+            subj = ranked[idx % len(ranked)]
+            dur = min(session_length_pref, remaining)
+            topic_pool = subj.get("weak_topics") or subj.get("topics") or []
+            topic = topic_pool[idx % len(topic_pool)] if topic_pool else None
+
+            sessions.append(
+                {
+                    "date": day.isoformat(),
+                    "time": f"{hour:02d}:00",
+                    "subject_name": subj["name"],
+                    "topic": topic,
+                    "duration_mins": dur,
+                    "mode": "review" if idx % 3 == 0 else "flashcard",
+                    "priority": (
+                        "weak_area" if subj.get("weak_topics") else "normal"
+                    ),
+                }
+            )
+            remaining -= dur
+            hour += 1
+            idx += 1
+
+    return {"sessions": sessions}

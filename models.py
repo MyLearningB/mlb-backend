@@ -2,6 +2,7 @@ import uuid
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import List, Optional
+
 from sqlalchemy import event
 
 from sqlmodel import SQLModel, Field, Relationship
@@ -165,11 +166,6 @@ class User(SQLModel, table=True):
     # --------------------------------------
     # STREAKS
     # --------------------------------------
-    #
-    # These are kept in sync by complete_session() in main.py.
-    # They power /users/me/profile's streak display. The dashboard
-    # computes streak independently from DailyActivity rows — both
-    # must agree, so complete_session updates both in one commit.
 
     current_streak: int = Field(
         default=0,
@@ -403,6 +399,15 @@ class Quest(SQLModel, table=True):
 #   * arc_version   : bumped whenever the arc is rebased, so we
 #                     can tell which skeleton a plan was using on
 #                     a given day. Useful for debugging.
+#
+# NEW (multi-subject support):
+#   * plan_type     : "single_goal" | "exam_prep" | "semester"
+#                     | "certification" | "skill". Drives the UI
+#                     and the AI prompt tone.
+#   * notes         : free-form hints the user typed in the goal
+#                     sheet. Passed to the AI verbatim.
+#   * subjects[]    : one PlanSubject row per subject in the plan.
+#                     A legacy single-goal plan has exactly one.
 
 class StudyPlan(SQLModel, table=True):
     id: Optional[int] = Field(
@@ -419,10 +424,7 @@ class StudyPlan(SQLModel, table=True):
     # --------------------------------------
     # Per-plan metadata
     # --------------------------------------
-    # `title` is a user-facing label ("IELTS Academic"),
-    # `subject` stays as the AI-facing subject string.
-    # `goal_type` is the persona for THIS plan (may differ
-    # from User.goal_type — a uni student learning chess).
+
     title: str = Field(default="My Plan", max_length=80)
 
     subject: str
@@ -439,6 +441,19 @@ class StudyPlan(SQLModel, table=True):
 
     # Soft delete so we never blow away session history.
     is_archived: bool = Field(default=False, index=True)
+
+    # --------------------------------------
+    # NEW — multi-subject metadata
+    # --------------------------------------
+
+    plan_type: str = Field(
+        default="single_goal",
+        max_length=30,
+    )
+
+    notes: Optional[str] = Field(
+        default=None,
+    )
 
     # --------------------------------------
     # ROLLING WINDOW
@@ -463,9 +478,6 @@ class StudyPlan(SQLModel, table=True):
     # PHASE SKELETON
     # --------------------------------------
 
-    # JSON-serialized PhasePlan. Kept as text so we don't need
-    # a child table for 5 rows of data that are never queried
-    # individually.
     phase_plan: Optional[str] = Field(
         default=None,
     )
@@ -495,9 +507,16 @@ class StudyPlan(SQLModel, table=True):
         cascade_delete=True,
     )
 
+    subjects: List["PlanSubject"] = Relationship(
+        back_populates="plan",
+        cascade_delete=True,
+    )
+
+
 @event.listens_for(StudyPlan, "before_update")
 def _touch_study_plan_updated_at(mapper, connection, target):
     target.updated_at = utc_now()
+
 
 class StudySession(SQLModel, table=True):
     id: Optional[int] = Field(
@@ -523,6 +542,20 @@ class StudySession(SQLModel, table=True):
 
     subject: str
 
+    # NEW — link to the plan's PlanSubject row when known.
+    subject_id: Optional[int] = Field(
+        default=None,
+        foreign_key="plansubject.id",
+        ondelete="SET NULL",
+        index=True,
+    )
+
+    # NEW — specific sub-topic.
+    topic: Optional[str] = Field(
+        default=None,
+        max_length=200,
+    )
+
     duration_mins: int = Field(
         ge=1,
     )
@@ -545,6 +578,59 @@ class StudySession(SQLModel, table=True):
 
     user: Optional["User"] = Relationship(
         back_populates="study_sessions",
+    )
+
+
+# ==========================================
+# PLAN SUBJECT
+# ==========================================
+#
+# One row per subject/topic-area inside a plan. A legacy
+# single-goal plan has exactly one row (auto-created from the
+# legacy `goal` string). A semester plan has one per course.
+#
+# `topics` and `weak_topics` are JSON-encoded list[str] for the
+# same reason phase_plan is text — we never query them
+# individually, only hydrate them into the AI prompt.
+
+class PlanSubject(SQLModel, table=True):
+    id: Optional[int] = Field(
+        default=None,
+        primary_key=True,
+    )
+
+    plan_id: int = Field(
+        foreign_key="studyplan.id",
+        ondelete="CASCADE",
+        index=True,
+    )
+
+    name: str = Field(max_length=100)
+
+    exam_date: Optional[date] = None
+
+    weight: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+    )
+
+    # "beginner" | "intermediate" | "advanced"
+    current_level: str = Field(
+        default="intermediate",
+        max_length=20,
+    )
+
+    topics: str = Field(default="[]")
+
+    weak_topics: str = Field(default="[]")
+
+    created_at: datetime = Field(
+        default_factory=utc_now,
+    )
+
+    plan: Optional["StudyPlan"] = Relationship(
+        back_populates="subjects",
     )
 
 
@@ -1271,23 +1357,6 @@ class UserTrophy(SQLModel, table=True):
 # ==========================================
 # FEEDBACK
 # ==========================================
-#
-# Two different flows write to this table:
-#
-#   1. Generic app feedback  → POST /users/me/feedback
-#      Sets: user_id, message
-#
-#   2. AI solution feedback  → POST /solve/{id}/feedback
-#      Sets: user_id, solution_id, helpful, flag_reason
-#
-# Historically only `message` existed, which made every call to
-# the AI-solution-feedback endpoint crash with an AttributeError
-# at commit time (the model silently accepted the extra kwargs
-# as transient Python attrs and then SQLAlchemy choked).
-#
-# Both shapes are now supported with all fields optional except
-# user_id, so either flow can write without providing the other's
-# fields.
 
 class Feedback(SQLModel, table=True):
     id: Optional[int] = Field(

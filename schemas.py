@@ -157,10 +157,6 @@ class PetDashboardInfo(BaseModel):
     xp: int
     xp_to_next: int
 
-    # NEW — within-level XP detail so the Flutter side doesn't
-    # have to do arithmetic. Both are 0 when is_maxed is true.
-    #   * xp_into_level  — XP earned inside the current level
-    #   * level_xp_span  — total XP the current level requires
     xp_into_level: int = 0
     level_xp_span: int = 0
 
@@ -239,6 +235,8 @@ class SessionDetail(BaseModel):
     date: str
     time: Optional[str] = None
     subject: str
+    topic: Optional[str] = None
+    subject_id: Optional[int] = None
     duration_mins: int
 
     mode: Literal["flashcard", "feynman", "review"]
@@ -286,6 +284,20 @@ class PhasePlan(BaseModel):
 # PLAN RESPONSE
 # ==========================================
 
+class PlanSubjectResponse(BaseModel):
+    id: int
+    name: str
+    exam_date: Optional[date] = None
+    weight: int
+    current_level: str
+    topics: List[str] = Field(default_factory=list)
+    weak_topics: List[str] = Field(default_factory=list)
+
+    # Denormalised progress so the client doesn't need N+1 calls
+    session_count: int = 0
+    completed_count: int = 0
+
+
 class PlanResponse(BaseModel):
     plan_id: int
 
@@ -300,6 +312,11 @@ class PlanResponse(BaseModel):
     week: List[WeekDay]
     sessions: List[SessionDetail]
     nudge: Optional[Nudge] = None
+
+    # Multi-subject metadata
+    subjects: List[PlanSubjectResponse] = Field(default_factory=list)
+    plan_type: str = "single_goal"
+    notes: Optional[str] = None
 
     # Arc metadata (computed in routers/plan.py)
     total_weeks: Optional[int] = None
@@ -318,10 +335,41 @@ class PlanAvailability(BaseModel):
     minutes_per_day: Optional[int] = Field(default=None, ge=15, le=600)
     study_days_per_week: Optional[int] = Field(default=None, ge=1, le=7)
 
+    # Richer window the AI must respect
+    earliest: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    latest: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    session_length_pref: Optional[int] = Field(default=None, ge=10, le=180)
+
+
+class PlanSubjectInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    exam_date: Optional[date] = None
+    weight: int = Field(default=3, ge=1, le=5)
+    current_level: Literal["beginner", "intermediate", "advanced"] = "intermediate"
+    topics: List[str] = Field(default_factory=list, max_length=50)
+    weak_topics: List[str] = Field(default_factory=list, max_length=50)
+
 
 class PlanGenerateRequest(BaseModel):
-    goal: str = Field(..., min_length=1, max_length=200)
+    """
+    Two supported shapes:
+
+      1. Legacy single-goal:
+         { "goal": "WAEC Biology", "deadline": "2026-06-01" }
+
+      2. Multi-subject:
+         { "title": "Fall 2025", "plan_type": "semester",
+           "subjects": [{"name": "CHEM 201"}, {"name": "BIO 101"}] }
+
+    Both may be present — `subjects[]` wins when non-empty.
+    """
+    goal: Optional[str] = Field(default=None, min_length=1, max_length=200)
     deadline: Optional[date] = None
+
+    subjects: Optional[List[PlanSubjectInput]] = None
+    plan_type: Literal[
+        "single_goal", "exam_prep", "semester", "certification", "skill"
+    ] = "single_goal"
 
     goal_type: Optional[str] = None
 
@@ -330,6 +378,9 @@ class PlanGenerateRequest(BaseModel):
     color_hex: Optional[str] = Field(default=None, max_length=9)
 
     availability: Optional[PlanAvailability] = None
+
+    # Free-form hint the AI reads verbatim
+    notes: Optional[str] = Field(default=None, max_length=1000)
 
 
 class PlanUpdateRequest(BaseModel):

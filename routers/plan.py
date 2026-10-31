@@ -17,6 +17,7 @@ from database import get_session
 from models import (
     DailyActivity,
     Pet,
+    PlanSubject,
     StudyPlan,
     StudySession,
     User,
@@ -31,6 +32,8 @@ from schemas import (
     PlanListResponse,
     PlanResponse,
     PlanStats,
+    PlanSubjectInput,
+    PlanSubjectResponse,
     PlanUpdateRequest,
     SessionDetail,
     SessionUpdateRequest,
@@ -40,6 +43,8 @@ from schemas import (
 )
 from security import get_current_user
 from ai_service import (
+    build_fallback_schedule,
+    generate_gemini_multisubject_plan,
     generate_gemini_phase_plan,
     generate_gemini_study_plan,
 )
@@ -106,6 +111,7 @@ def _build_plan_response(
     db_plan: StudyPlan,
     db_sessions: list,
     local_today: date,
+    db_subjects: Optional[list] = None,
 ) -> PlanResponse:
     """Shared PlanResponse builder."""
     total_weeks, current_week, phase_name, phase_milestone = (
@@ -143,11 +149,6 @@ def _build_plan_response(
     # ----------------------------------------------------------
     # Week strip — richer session_type
     # ----------------------------------------------------------
-    # The Flutter strip reads `session_type` to pick the dot
-    # colour under each pill. It supports "study" (green),
-    # "review" (peach), "weak_area" (peach), and "rest" (no dot).
-    # Previously this emitted only "study" / "rest", so the two
-    # peach branches in the widget were dead code.
     week = []
     for i in range(7):
         current_date = local_today + timedelta(days=i)
@@ -182,6 +183,8 @@ def _build_plan_response(
             date=s.date,
             time=s.time or "16:00",
             subject=s.subject,
+            topic=getattr(s, "topic", None),
+            subject_id=getattr(s, "subject_id", None),
             duration_mins=s.duration_mins,
             mode=normalize_mode(s.mode),
             priority=normalize_priority(s.priority),
@@ -190,6 +193,32 @@ def _build_plan_response(
         )
         for s in upcoming_sorted
     ]
+
+    subjects_resp = []
+    for ps in (db_subjects or []):
+        ps_sessions = [s for s in db_sessions if s.subject_id == ps.id]
+        try:
+            topics_list = json.loads(ps.topics or "[]")
+        except (ValueError, TypeError):
+            topics_list = []
+        try:
+            weak_list = json.loads(ps.weak_topics or "[]")
+        except (ValueError, TypeError):
+            weak_list = []
+
+        subjects_resp.append(
+            PlanSubjectResponse(
+                id=ps.id,
+                name=ps.name,
+                exam_date=ps.exam_date,
+                weight=ps.weight,
+                current_level=ps.current_level,
+                topics=topics_list,
+                weak_topics=weak_list,
+                session_count=len(ps_sessions),
+                completed_count=sum(1 for s in ps_sessions if s.completed),
+            )
+        )
 
     return PlanResponse(
         plan_id=db_plan.id,
@@ -206,6 +235,9 @@ def _build_plan_response(
         week=week,
         sessions=formatted_sessions,
         nudge=None,
+        subjects=subjects_resp,
+        plan_type=db_plan.plan_type or "single_goal",
+        notes=db_plan.notes,
         total_weeks=total_weeks,
         current_week=current_week,
         phase_name=phase_name,
@@ -303,10 +335,15 @@ def get_latest_study_plan(
         select(StudySession).where(StudySession.plan_id == db_plan.id)
     ).all()
 
+    db_subjects = session.exec(
+        select(PlanSubject).where(PlanSubject.plan_id == db_plan.id)
+    ).all()
+
     return _build_plan_response(
         db_plan,
         db_sessions,
         get_local_now(x_timezone).date(),
+        db_subjects=db_subjects,
     )
 
 
@@ -342,10 +379,15 @@ def get_study_plan_by_id(
         select(StudySession).where(StudySession.plan_id == db_plan.id)
     ).all()
 
+    db_subjects = session.exec(
+        select(PlanSubject).where(PlanSubject.plan_id == db_plan.id)
+    ).all()
+
     return _build_plan_response(
         db_plan,
         db_sessions,
         get_local_now(x_timezone).date(),
+        db_subjects=db_subjects,
     )
 
 
@@ -368,83 +410,106 @@ async def generate_study_plan(
 ):
     today = get_local_now(x_timezone).date()
 
-    days_remaining = None
-    if payload.deadline:
-        days_remaining = (payload.deadline - today).days
-        if days_remaining < 0:
+    # ── 1. Normalise input ─────────────────────────────────
+    subjects_input = payload.subjects or []
+    if not subjects_input:
+        if not payload.goal:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Deadline passed.",
+                detail="Provide either `goal` or `subjects[]`.",
+            )
+        subjects_input = [PlanSubjectInput(name=payload.goal)]
+
+    if len(subjects_input) > 30:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 30 subjects per plan.",
+        )
+
+    for s in subjects_input:
+        if s.exam_date and s.exam_date < today:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Exam date for '{s.name}' is in the past.",
             )
 
-    resolved_goal_type = resolve_goal_type(
-        payload.goal_type,
-        current_user.goal_type,
+    # Plan deadline = latest exam date, or explicit payload.deadline
+    latest_exam = max(
+        (s.exam_date for s in subjects_input if s.exam_date),
+        default=None,
     )
-    defaults = persona_defaults(resolved_goal_type)
+    deadline = payload.deadline or latest_exam
+    if deadline and (deadline - today).days < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Deadline passed.",
+        )
+    days_remaining = (deadline - today).days if deadline else None
 
+    # ── 2. Persona + availability ──────────────────────────
+    goal_type = resolve_goal_type(payload.goal_type, current_user.goal_type)
+    defaults = persona_defaults(goal_type)
+    avail = payload.availability
     minutes_per_day = (
-        payload.availability.minutes_per_day
-        if payload.availability and payload.availability.minutes_per_day
+        avail.minutes_per_day
+        if avail and avail.minutes_per_day
         else (current_user.daily_goal_mins or DEFAULT_MINUTES_PER_DAY)
     )
-    study_days_per_week = (
-        payload.availability.study_days_per_week
-        if payload.availability and payload.availability.study_days_per_week
+    study_days = (
+        avail.study_days_per_week
+        if avail and avail.study_days_per_week
         else DEFAULT_STUDY_DAYS_PER_WEEK
     )
+    session_pref = (
+        avail.session_length_pref
+        if avail and avail.session_length_pref
+        else 45
+    )
+    earliest = (avail.earliest if avail and avail.earliest else "07:00")
+    latest = (avail.latest if avail and avail.latest else "22:00")
 
     window_days = DEFAULT_WINDOW_DAYS
     if days_remaining is not None and days_remaining < DEFAULT_WINDOW_DAYS:
         window_days = max(days_remaining, 1)
 
+    # ── 3. Phase skeleton (only if multi-week) ────────────
     total_wk = (
-        max(1, ceil(days_remaining / 7))
-        if days_remaining is not None
-        else -1
+        max(1, ceil(days_remaining / 7)) if days_remaining is not None else -1
     )
-
     phase_data = None
     if total_wk >= 2:
+        label = (
+            subjects_input[0].name
+            if len(subjects_input) == 1
+            else (payload.title or payload.goal or "multi-subject plan")
+        )
         phase_data = await generate_gemini_phase_plan(
-            goal=payload.goal,
-            goal_type=resolved_goal_type,
+            goal=label,
+            goal_type=goal_type,
             total_weeks=total_wk,
             minutes_per_day=minutes_per_day,
-            study_days_per_week=study_days_per_week,
+            study_days_per_week=study_days,
         )
-
     first_phase = (
         phase_data["phases"][0]
         if phase_data and phase_data.get("phases")
         else None
     )
 
-    window_data = await generate_gemini_study_plan(
-        goal=payload.goal,
-        target_date=payload.deadline,
-        days_remaining=days_remaining,
-        goal_type=resolved_goal_type,
-        window_start=today,
-        window_days=window_days,
-        phase_context=first_phase,
-        minutes_per_day=minutes_per_day,
-        study_days_per_week=study_days_per_week,
-    )
-
-    if not window_data:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate plan.",
+    # ── 4. Persist plan + subjects ─────────────────────────
+    try:
+        title = payload.title or (
+            subjects_input[0].name
+            if len(subjects_input) == 1
+            else f"{len(subjects_input)}-subject plan"
         )
 
-    try:
         db_plan = StudyPlan(
             user_id=current_user.id,
-            title=payload.title or payload.goal,
-            subject=payload.goal,
-            goal_type=resolved_goal_type,
-            deadline=payload.deadline,
+            title=title[:80],
+            subject=subjects_input[0].name,
+            goal_type=goal_type,
+            deadline=deadline,
             emoji=payload.emoji or defaults["emoji"],
             color_hex=payload.color_hex or defaults["color_hex"],
             is_approved=False,
@@ -452,28 +517,29 @@ async def generate_study_plan(
             window_start=today,
             window_days=window_days,
             phase_plan=json.dumps(phase_data) if phase_data else None,
+            plan_type=payload.plan_type,
+            notes=payload.notes,
         )
-
         session.add(db_plan)
         session.commit()
         session.refresh(db_plan)
 
-        for ai_session in window_data.get("sessions", []):
-            session.add(
-                StudySession(
-                    plan_id=db_plan.id,
-                    user_id=current_user.id,
-                    date=ai_session["date"],
-                    time=ai_session["time"],
-                    subject=ai_session["subject"],
-                    duration_mins=ai_session["duration_mins"],
-                    mode=ai_session["mode"],
-                    priority=ai_session["priority"],
-                    completed=False,
-                )
+        db_subjects: list[PlanSubject] = []
+        for s in subjects_input:
+            ps = PlanSubject(
+                plan_id=db_plan.id,
+                name=s.name[:100],
+                exam_date=s.exam_date,
+                weight=s.weight,
+                current_level=s.current_level,
+                topics=json.dumps(s.topics or []),
+                weak_topics=json.dumps(s.weak_topics or []),
             )
-
+            session.add(ps)
+            db_subjects.append(ps)
         session.commit()
+        for ps in db_subjects:
+            session.refresh(ps)
 
     except Exception:
         session.rollback()
@@ -482,11 +548,244 @@ async def generate_study_plan(
             detail="Could not save your study plan. Please try again.",
         )
 
+    # ── 5. Generate sessions (retry → fallback) ───────────
+    subjects_dicts = [
+        {
+            "name": ps.name,
+            "exam_date": ps.exam_date,
+            "weight": ps.weight,
+            "current_level": ps.current_level,
+            "topics": json.loads(ps.topics or "[]"),
+            "weak_topics": json.loads(ps.weak_topics or "[]"),
+        }
+        for ps in db_subjects
+    ]
+    subject_id_by_name = {ps.name: ps.id for ps in db_subjects}
+
+    window_data = None
+    for _attempt in (1, 2):
+        window_data = await generate_gemini_multisubject_plan(
+            subjects=subjects_dicts,
+            plan_title=title,
+            plan_type=payload.plan_type,
+            goal_type=goal_type,
+            window_start=today,
+            window_days=window_days,
+            minutes_per_day=minutes_per_day,
+            study_days_per_week=study_days,
+            earliest=earliest,
+            latest=latest,
+            session_length_pref=session_pref,
+            phase_context=first_phase,
+            notes=payload.notes,
+        )
+        if window_data and window_data.get("sessions"):
+            break
+
+    if not window_data or not window_data.get("sessions"):
+        window_data = build_fallback_schedule(
+            subjects=subjects_dicts,
+            window_start=today,
+            window_days=window_days,
+            minutes_per_day=minutes_per_day,
+            study_days_per_week=study_days,
+            session_length_pref=session_pref,
+        )
+
+    try:
+        for s in window_data["sessions"]:
+            session.add(
+                StudySession(
+                    plan_id=db_plan.id,
+                    user_id=current_user.id,
+                    date=s["date"],
+                    time=s["time"],
+                    subject=s["subject_name"],
+                    subject_id=subject_id_by_name.get(s["subject_name"]),
+                    topic=s.get("topic"),
+                    duration_mins=s["duration_mins"],
+                    mode=s["mode"],
+                    priority=s["priority"],
+                    completed=False,
+                )
+            )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save sessions. Please try again.",
+        )
+
     db_sessions = session.exec(
         select(StudySession).where(StudySession.plan_id == db_plan.id)
     ).all()
 
-    return _build_plan_response(db_plan, db_sessions, today)
+    return _build_plan_response(
+        db_plan,
+        db_sessions,
+        today,
+        db_subjects=db_subjects,
+    )
+
+
+# ============================================================
+# EXTEND PLAN WINDOW
+# ============================================================
+#
+# Tops up the rolling window by `window_days` from the day after
+# the current last session. This is what fixes the "plan looks
+# empty after a week" complaint — the client calls this when the
+# user taps "Generate next 14 days".
+
+@router.post(
+    "/users/me/plan/{plan_id}/extend",
+    response_model=PlanResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def extend_study_plan(
+    plan_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+):
+    today = get_local_now(x_timezone).date()
+
+    db_plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == current_user.id,
+        )
+    ).first()
+    if not db_plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Plan not found.",
+        )
+    if db_plan.is_archived:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot extend an archived plan.",
+        )
+
+    db_subjects = session.exec(
+        select(PlanSubject).where(PlanSubject.plan_id == plan_id)
+    ).all()
+    if not db_subjects:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Plan has no subjects to extend.",
+        )
+
+    # Window starts the day after the latest existing session
+    last = session.exec(
+        select(StudySession)
+        .where(StudySession.plan_id == plan_id)
+        .order_by(StudySession.date.desc())
+    ).first()
+
+    window_start = today
+    if last:
+        try:
+            tail = date.fromisoformat(last.date)
+            window_start = max(today, tail + timedelta(days=1))
+        except (ValueError, TypeError):
+            pass
+
+    window_days = db_plan.window_days or DEFAULT_WINDOW_DAYS
+    if db_plan.deadline:
+        remaining = (db_plan.deadline - window_start).days
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Plan deadline has passed.",
+            )
+        window_days = min(window_days, remaining)
+
+    minutes_per_day = current_user.daily_goal_mins or DEFAULT_MINUTES_PER_DAY
+    study_days = DEFAULT_STUDY_DAYS_PER_WEEK
+
+    subjects_dicts = [
+        {
+            "name": ps.name,
+            "exam_date": ps.exam_date,
+            "weight": ps.weight,
+            "current_level": ps.current_level,
+            "topics": json.loads(ps.topics or "[]"),
+            "weak_topics": json.loads(ps.weak_topics or "[]"),
+        }
+        for ps in db_subjects
+    ]
+    subject_id_by_name = {ps.name: ps.id for ps in db_subjects}
+
+    recent = session.exec(
+        select(StudySession)
+        .where(StudySession.plan_id == plan_id)
+        .order_by(StudySession.date.desc())
+        .limit(20)
+    ).all()
+    recent_topics = [
+        s.topic or s.subject for s in recent if (s.topic or s.subject)
+    ]
+
+    window_data = await generate_gemini_multisubject_plan(
+        subjects=subjects_dicts,
+        plan_title=db_plan.title or db_plan.subject,
+        plan_type=db_plan.plan_type or "single_goal",
+        goal_type=db_plan.goal_type,
+        window_start=window_start,
+        window_days=window_days,
+        minutes_per_day=minutes_per_day,
+        study_days_per_week=study_days,
+        notes=db_plan.notes,
+        recent_topics=recent_topics,
+    )
+    if not window_data or not window_data.get("sessions"):
+        window_data = build_fallback_schedule(
+            subjects=subjects_dicts,
+            window_start=window_start,
+            window_days=window_days,
+            minutes_per_day=minutes_per_day,
+            study_days_per_week=study_days,
+        )
+
+    try:
+        for s in window_data["sessions"]:
+            session.add(
+                StudySession(
+                    plan_id=plan_id,
+                    user_id=current_user.id,
+                    date=s["date"],
+                    time=s["time"],
+                    subject=s["subject_name"],
+                    subject_id=subject_id_by_name.get(s["subject_name"]),
+                    topic=s.get("topic"),
+                    duration_mins=s["duration_mins"],
+                    mode=s["mode"],
+                    priority=s["priority"],
+                    completed=False,
+                )
+            )
+        db_plan.window_start = window_start
+        session.add(db_plan)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not extend plan. Please try again.",
+        )
+
+    db_sessions = session.exec(
+        select(StudySession).where(StudySession.plan_id == plan_id)
+    ).all()
+
+    return _build_plan_response(
+        db_plan,
+        db_sessions,
+        today,
+        db_subjects=db_subjects,
+    )
 
 
 # ============================================================
@@ -570,7 +869,9 @@ def archive_plan(
     session.commit()
 
     return {
-        "message": "Plan archived." if payload.archived else "Plan restored.",
+        "message": (
+            "Plan archived." if payload.archived else "Plan restored."
+        ),
         "plan_id": db_plan.id,
         "is_archived": db_plan.is_archived,
     }
@@ -681,12 +982,21 @@ def add_manual_session(
             detail="Study plan not found.",
         )
 
+    # Auto-link to a PlanSubject row if the name matches.
+    subject_row = session.exec(
+        select(PlanSubject).where(
+            PlanSubject.plan_id == db_plan.id,
+            PlanSubject.name == payload.subject,
+        )
+    ).first()
+
     new_session = StudySession(
         plan_id=db_plan.id,
         user_id=current_user.id,
         date=payload.date,
         time=payload.time,
         subject=payload.subject,
+        subject_id=subject_row.id if subject_row else None,
         duration_mins=payload.duration_mins,
         mode=normalize_mode(payload.mode),
         priority=normalize_priority(payload.priority),
@@ -703,6 +1013,7 @@ def add_manual_session(
             "id": str(new_session.id),
             "date": new_session.date,
             "subject": new_session.subject,
+            "subject_id": new_session.subject_id,
             "duration_mins": new_session.duration_mins,
             "mode": new_session.mode,
         },
@@ -760,6 +1071,8 @@ def update_session(
         "date": db_session.date,
         "time": db_session.time,
         "subject": db_session.subject,
+        "topic": db_session.topic,
+        "subject_id": db_session.subject_id,
         "duration_mins": db_session.duration_mins,
         "mode": normalize_mode(db_session.mode),
         "priority": normalize_priority(db_session.priority),
