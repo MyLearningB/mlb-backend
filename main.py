@@ -539,11 +539,14 @@ def get_dashboard(
             TodayPlanSession(
                 id=str(s.id),
                 plan_id=plan.id,
+                plan_title=plan.title or plan.subject,
                 subject=s.subject,
+                topic=s.topic,
                 duration_mins=s.duration_mins,
                 mode=normalize_mode(s.mode),
                 emoji=plan.emoji,
                 color_hex=plan.color_hex,
+                completed=s.completed,
             )
         )
         if len(real_today_plan) >= 8:

@@ -188,11 +188,18 @@ class Quest(BaseModel):
 class TodayPlanSession(BaseModel):
     id: str
     plan_id: Optional[int] = None
+    # NEW — distinguishes which plan this session belongs to, so a
+    # user running "School" + "GRE" plans can tell the chips apart.
+    plan_title: Optional[str] = None
     subject: str
+    # NEW — specific sub-topic when the plan has one.
+    topic: Optional[str] = None
     duration_mins: int
     mode: str
     emoji: Optional[str] = None
     color_hex: Optional[str] = None
+    # NEW — lets the chip render a strikethrough + tick.
+    completed: bool = False
 
 
 class DashboardResponse(BaseModel):
