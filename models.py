@@ -896,6 +896,24 @@ class Note(SQLModel, table=True):
         default_factory=utc_now,
     )
 
+    # --------------------------------------
+    # FLASHCARD GENERATION STATE (notes v2)
+    # --------------------------------------
+    # "idle" | "generating" | "ready" | "failed"
+    card_status: str = Field(
+        default="idle",
+        max_length=20,
+    )
+
+    card_error: Optional[str] = Field(
+        default=None,
+        max_length=300,
+    )
+
+    # When the current generation started — used to expire runs that
+    # died with the server.
+    card_status_at: Optional[datetime] = None
+
     user: Optional["User"] = Relationship(
         back_populates="notes",
     )
