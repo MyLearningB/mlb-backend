@@ -499,12 +499,15 @@ class SolveFeedbackRequest(BaseModel):
 # ==========================================
 
 class NodeCreate(BaseModel):
-    label: str = Field(..., max_length=40)
+    label: str = Field(..., min_length=1, max_length=40)
     x: float
     y: float
     size: Literal["small", "medium", "large"] = "medium"
     is_hero: bool = False
     is_weak: bool = False
+    definition: Optional[str] = Field(default=None, max_length=500)
+    # When set, the server also creates parent -> new node connection.
+    parent_id: Optional[UUID] = None
 
 
 class NodeUpdate(BaseModel):
@@ -514,19 +517,29 @@ class NodeUpdate(BaseModel):
     size: Optional[Literal["small", "medium", "large"]] = None
     is_hero: Optional[bool] = None
     is_weak: Optional[bool] = None
+    # Send "" to clear the definition.
+    definition: Optional[str] = Field(default=None, max_length=500)
 
 
 class ConnectionCreate(BaseModel):
     from_node_id: UUID
     to_node_id: UUID
-    label: Optional[str] = None
+    label: Optional[str] = Field(default=None, max_length=60)
 
 
 class CanvasCreate(BaseModel):
-    name: str
-    subject: str
+    name: str = Field(default="Untitled Canvas", max_length=80)
+    subject: str = Field(default="General", max_length=100)
     source_type: Literal["notes", "upload", "manual"] = "manual"
     source_id: Optional[int] = None
+    # FIX: the from-notes route reads payload.note_id, but this field
+    # did not exist, so every "From notes" request crashed with a 500.
+    note_id: Optional[int] = None
+
+
+class CanvasUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    subject: Optional[str] = Field(default=None, min_length=1, max_length=100)
 
 
 class NodeResponse(BaseModel):
@@ -560,6 +573,8 @@ class CanvasResponse(BaseModel):
     last_studied_at: Optional[datetime] = None
     created_at: datetime
     is_public: bool
+    status: str = "ready"
+    error_message: Optional[str] = None
     nodes: List[NodeResponse] = Field(default_factory=list)
     connections: List[ConnectionResponse] = Field(default_factory=list)
 
@@ -567,6 +582,7 @@ class CanvasResponse(BaseModel):
 class CanvasStatusResponse(BaseModel):
     status: Literal["ready", "processing", "failed"]
     node_count: int
+    error: Optional[str] = None
     nodes: List[NodeResponse] = Field(default_factory=list)
 
 

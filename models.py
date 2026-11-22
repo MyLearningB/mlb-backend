@@ -962,6 +962,37 @@ class Canvas(SQLModel, table=True):
         default=False,
     )
 
+    # --------------------------------------
+    # AI GENERATION STATE (canvas v2)
+    # --------------------------------------
+    # "processing" | "ready" | "failed". The server is the single
+    # source of truth — the client no longer guesses from node_count
+    # and its own clock.
+    status: str = Field(
+        default="ready",
+        max_length=20,
+        index=True,
+    )
+
+    # Short, user-facing reason when status == "failed".
+    error_message: Optional[str] = Field(
+        default=None,
+        max_length=300,
+    )
+
+    # The text the AI reads (note content or extracted upload text,
+    # capped). Stored so "Try again" works without a re-upload.
+    # NEVER returned by list/detail endpoints.
+    source_text: Optional[str] = Field(
+        default=None,
+    )
+
+    # Bumped whenever status changes or a retry starts. Used to
+    # detect generations that died with the server (Render restarts).
+    updated_at: datetime = Field(
+        default_factory=utc_now,
+    )
+
     user: Optional["User"] = Relationship(
         back_populates="canvases",
     )
