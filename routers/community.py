@@ -144,10 +144,13 @@ def get_active_quests(current_user: User = Depends(get_current_user), db: Sessio
 # ==========================================
 # 3. XP HOOK (Import this into Flashcard/Feynman routers)
 # ==========================================
-def contribute_to_group_quests(user_id: int, xp_amount: int, db: Session):
+def contribute_to_group_quests(user_id: int, xp_amount: int, db: Session, commit: bool = True):
     """
-    Hook to pool XP. 
-    Optimized to fetch all relevant quests in one query and commit once.
+    Hook to pool XP.
+    Optimized to fetch all relevant quests in one query.
+
+    gamification.award_xp() calls this with commit=False so the XP,
+    pet, streak and quest updates are saved together in ONE commit.
     """
     memberships = db.exec(select(GroupMember).where(GroupMember.user_id == user_id)).all()
     group_ids = [m.group_id for m in memberships]
@@ -170,5 +173,5 @@ def contribute_to_group_quests(user_id: int, xp_amount: int, db: Session):
             
         db.add(quest)
             
-    # FIXED: Single atomic commit for all quest updates
-    db.commit()
+    if commit:
+        db.commit()

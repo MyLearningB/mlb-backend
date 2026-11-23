@@ -5,7 +5,6 @@ import json
 import uuid
 from typing import Optional
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlmodel import Session, select, or_
@@ -21,11 +20,10 @@ from models import (
     DailyActivity, Pet, Collection, CollectionItem, CollectionAccess,
 )
 
-# ✨ IMPORT THE STREAK HELPER ✨
-from routers.profile import update_user_streak
-
-# 👉 NEW: IMPORT THE CO-OP XP HOOK
-from routers.community import contribute_to_group_quests
+# XP, pet level-ups, streak and co-op quests all go through ONE
+# function so the numbers can't drift apart.
+from gamification import award_xp
+from utils import get_local_now
 
 load_dotenv()
 
@@ -82,15 +80,6 @@ class FeynmanCompleteRequest(BaseModel):
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
-
-def get_local_now(timezone_str: str = "UTC") -> datetime:
-    """Helper to ensure streaks are calculated in the user's local timezone"""
-    try:
-        tz = ZoneInfo(timezone_str)
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("UTC")
-    return datetime.now(tz)
-
 
 def extract_text_from_file(file) -> str:
     """Reads uploaded files directly from RAM without hitting the disk.
@@ -150,15 +139,12 @@ def extract_text_from_file(file) -> str:
 
 
 def _recompute_weak_cards_count(db: Session, study_set_id: int) -> int:
-    """Recount weak cards for a set and update the denormalized field.
-
-    Called any time a card's `is_weak` flag changes so the mode
-    selection screen's 'X weak' badge stays truthful.
-    """
-    cards = db.exec(
-        select(Flashcard).where(Flashcard.study_set_id == study_set_id)
+    """Recount weak cards for a set (called after a card's flag changes)."""
+    db.flush()
+    flags = db.exec(
+        select(Flashcard.is_weak).where(Flashcard.study_set_id == study_set_id)
     ).all()
-    return sum(1 for c in cards if c.is_weak)
+    return sum(1 for f in flags if f)
 
 
 # ==========================================
@@ -318,10 +304,10 @@ def record_swipe(
         raise HTTPException(status_code=404, detail="Card not found")
 
     if payload.response == "correct":
-        card.is_weak = False
+        is_weak = False
         xp_earned = 5
     elif payload.response == "incorrect":
-        card.is_weak = True
+        is_weak = True
         xp_earned = 1
     else:
         raise HTTPException(
@@ -329,24 +315,21 @@ def record_swipe(
             detail="Invalid response type. Use 'correct' or 'incorrect'."
         )
 
-    db.add(card)
-
-    # --------------------------------------------------------
-    # KEEP THE PARENT'S weak_cards_count IN SYNC
-    # --------------------------------------------------------
-    # Without this, the "X weak" badge on the mode selection
-    # screen never lights up.
+    # FIX: anyone could flip `is_weak` on ANY card by id. Only the
+    # set's owner changes the card; someone studying a shared set
+    # still gets their swipe counted, but the owner's deck is untouched.
     study_set = db.get(StudySet, card.study_set_id)
-    if study_set:
+    if study_set and study_set.user_id == current_user.id:
+        card.is_weak = is_weak
+        db.add(card)
         study_set.weak_cards_count = _recompute_weak_cards_count(
             db, study_set.id
         )
         db.add(study_set)
-
-    db.commit()
+        db.commit()
 
     return {
-        "is_weak": card.is_weak,
+        "is_weak": is_weak,
         "xp_earned": xp_earned
     }
 
@@ -359,54 +342,52 @@ def complete_flashcard_session(
     db: Session = Depends(get_session),
     x_timezone: str = Header("UTC")
 ):
-    base_xp = (payload.cards_correct * 5) + (payload.cards_incorrect * 1)
-    pet_xp_awarded = int(base_xp * 0.5)
+    # FIX: these numbers come from the app, so sanity-check them.
+    # At most 100 of each per session, and at least ~2 seconds per
+    # card — otherwise anyone could send cards_correct=99999.
+    correct = max(0, min(payload.cards_correct, 100))
+    incorrect = max(0, min(payload.cards_incorrect, 100))
+    answered = correct + incorrect
+    seconds = max(0, min(payload.duration_seconds, 4 * 60 * 60))
+    plausible = seconds // 2
+    if answered > plausible:
+        factor = plausible / answered if answered else 0
+        correct = int(correct * factor)
+        incorrect = int(incorrect * factor)
 
-    pet = db.exec(select(Pet).where(Pet.user_id == current_user.id)).first()
-    pet_type = "nova"
-    pet_level = 1
+    base_xp = (correct * 5) + incorrect
+    minutes = round(seconds / 60) if answered else 0
 
-    if pet:
-        pet.xp += pet_xp_awarded
-        db.add(pet)
-        pet_type = pet.pet_type
-        pet_level = pet.level
-
-    today_str = get_local_now(x_timezone).date().isoformat()
-    daily_activity = db.exec(select(DailyActivity).where(
-        DailyActivity.user_id == current_user.id,
-        DailyActivity.date == today_str
-    )).first()
-
-    if daily_activity:
-        daily_activity.xp_earned += base_xp
-    else:
-        daily_activity = DailyActivity(
-            user_id=current_user.id,
-            date=today_str,
-            xp_earned=base_xp
-        )
-
-    db.add(daily_activity)
-    update_user_streak(current_user, db)
-
-    # Funnel the earned XP into active Co-op Quests
-    contribute_to_group_quests(user_id=current_user.id, xp_amount=base_xp, db=db)
+    reward = award_xp(
+        db,
+        current_user,
+        base_xp,
+        local_now=get_local_now(x_timezone),
+        source="flashcards",
+        duration_mins=max(1, minutes) if answered else None,
+        minutes_studied=minutes,
+    )
 
     db.commit()
 
+    pet = reward["pet"] or {}
     return {
         "session_summary": {
-            "xp_earned": base_xp,
-            "pet_xp": pet_xp_awarded,
-            "pet_type": pet_type,
-            "pet_level": pet_level,
-            "streak_updated": True,
+            "xp_earned": reward["xp_earned"],
+            "pet_xp": reward["xp_earned"],
+            "bonus_xp": reward["bonus_xp"],
+            "bonus_reason": reward["bonus_reason"],
+            "pet_type": pet.get("type", "nova"),
+            "pet_level": pet.get("level", 1),
+            "leveled_up": pet.get("leveled_up", False),
+            "evolved": pet.get("evolved", False),
+            "streak_updated": reward["streak"]["extended"],
             "next_suggestions": [
                 {"label": "Tackle your weak cards", "action_type": "review_weak"},
                 {"label": "Deep dive with Feynman", "action_type": "feynman_mode"}
             ]
-        }
+        },
+        "reward": reward,
     }
 
 
@@ -421,7 +402,7 @@ def start_feynman_session(
     db: Session = Depends(get_session)
 ):
     card = db.get(Flashcard, payload.card_id)
-    if not card:
+    if not card or card.study_set_id != payload.set_id:
         raise HTTPException(status_code=404, detail="Flashcard not found")
 
     feynman_session = FeynmanSession(
@@ -501,10 +482,14 @@ def feynman_chat_message(
         )
 
         ai_data = json.loads(response.choices[0].message.content)
-        comp_score = ai_data.get(
-            "comprehension_score",
-            feynman_session.comprehension_score
-        )
+        try:
+            comp_score = int(ai_data.get(
+                "comprehension_score",
+                feynman_session.comprehension_score
+            ))
+        except (TypeError, ValueError):
+            comp_score = feynman_session.comprehension_score
+        comp_score = max(0, min(100, comp_score))
 
         feynman_session.comprehension_score = comp_score
         feynman_session.is_complete = ai_data.get("session_complete", False)
@@ -565,52 +550,46 @@ def complete_feynman_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     feynman_session.is_complete = True
+
+    # FIX: XP used to be whatever `final_score` the app sent, and could
+    # be claimed again and again for the same session. Now the score
+    # is the one the server's AI calculated, granted once.
+    if feynman_session.xp_awarded:
+        base_xp = 0
+    else:
+        base_xp = max(0, min(100, feynman_session.comprehension_score or 0))
+        feynman_session.xp_awarded = True
     db.add(feynman_session)
 
-    base_xp = payload.final_score
-    pet_xp = int(base_xp * 0.5)
+    minutes = max(0, min(payload.duration_seconds, 2 * 60 * 60)) // 60
 
-    today_str = get_local_now(x_timezone).date().isoformat()
-    daily_activity = db.exec(select(DailyActivity).where(
-        DailyActivity.user_id == current_user.id,
-        DailyActivity.date == today_str
-    )).first()
-
-    if daily_activity:
-        daily_activity.xp_earned += base_xp
-    else:
-        daily_activity = DailyActivity(
-            user_id=current_user.id,
-            date=today_str,
-            xp_earned=base_xp
-        )
-
-    db.add(daily_activity)
-
-    pet = db.exec(select(Pet).where(Pet.user_id == current_user.id)).first()
-    pet_type = "nova"
-    pet_level = 1
-
-    if pet:
-        pet.xp += pet_xp
-        db.add(pet)
-        pet_type = pet.pet_type
-        pet_level = pet.level
-
-    update_user_streak(current_user, db)
-    contribute_to_group_quests(user_id=current_user.id, xp_amount=base_xp, db=db)
+    reward = award_xp(
+        db,
+        current_user,
+        base_xp,
+        local_now=get_local_now(x_timezone),
+        source="feynman",
+        duration_mins=max(1, minutes),
+        minutes_studied=minutes,
+    )
 
     db.commit()
 
+    pet = reward["pet"] or {}
     return {
         "session_summary": {
-            "xp_earned": base_xp,
-            "pet_xp": pet_xp,
-            "pet_type": pet_type,
-            "pet_level": pet_level,
-            "comprehension_score": payload.final_score,
+            "xp_earned": reward["xp_earned"],
+            "pet_xp": reward["xp_earned"],
+            "bonus_xp": reward["bonus_xp"],
+            "bonus_reason": reward["bonus_reason"],
+            "pet_type": pet.get("type", "nova"),
+            "pet_level": pet.get("level", 1),
+            "leveled_up": pet.get("leveled_up", False),
+            "evolved": pet.get("evolved", False),
+            "comprehension_score": feynman_session.comprehension_score,
             "next_suggestions": [
                 {"label": "Review your gaps", "action_type": "review_gaps"}
             ]
-        }
+        },
+        "reward": reward,
     }

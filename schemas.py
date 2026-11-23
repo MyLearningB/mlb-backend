@@ -135,10 +135,13 @@ class StudyProfileUpdate(BaseModel):
     """
     Always-available endpoint for updating the user's default persona.
     Unlike OnboardingQuizSubmit, this is not gated by is_first_session.
+    Also used by onboarding step 3 ("What's your goal?").
     """
     goal_type: Optional[str] = None
-    study_goal: Optional[str] = None
+    study_goal: Optional[str] = Field(default=None, max_length=200)
     target_date: Optional[date] = None
+    clear_target_date: bool = False
+    daily_goal_mins: Optional[int] = Field(default=None, ge=10, le=600)
 
 
 # ==========================================
@@ -168,7 +171,18 @@ class PetDashboardInfo(BaseModel):
 
     progress_percent: float
 
+    # True once the FINAL evolution is reached. Levels keep counting.
     is_maxed: bool
+
+    # NEW — personality + evolution context (see gamification.py)
+    mood_message: str = ""
+    title: Optional[str] = None
+    trait: Optional[str] = None
+    trait_desc: Optional[str] = None
+    stage: int = 0
+    stage_name: Optional[str] = None
+    next_stage_level: Optional[int] = None
+    evolution_line: List[str] = Field(default_factory=list)
 
 
 class StreakInfo(BaseModel):
@@ -213,6 +227,11 @@ class DashboardResponse(BaseModel):
     goal_type: Optional[str] = None
     study_goal: Optional[str] = None
     target_date: Optional[date] = None
+    daily_goal_mins: Optional[int] = None
+
+    # NEW — server-decided onboarding routing: "quiz" | "pet" | "done"
+    onboarding_step: str = "done"
+    has_pet: bool = True
 
 
 # ==========================================
@@ -404,7 +423,7 @@ class PlanArchiveRequest(BaseModel):
 
 class SessionUpdateRequest(BaseModel):
     scheduled_time: Optional[str] = None
-    duration_mins: Optional[int] = Field(default=None, ge=1)
+    duration_mins: Optional[int] = Field(default=None, ge=1, le=300)
     skipped: Optional[bool] = None
 
 
@@ -412,7 +431,7 @@ class ManualSessionCreate(BaseModel):
     date: str
     time: str
     subject: str = Field(..., min_length=1, max_length=100)
-    duration_mins: int = Field(..., ge=1)
+    duration_mins: int = Field(..., ge=1, le=300)
     mode: str
     priority: str
 

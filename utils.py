@@ -79,83 +79,14 @@ def resolve_goal_type(
 # PET EVOLUTION
 # ============================================================
 #
-# A pet goes through four visual stages as its level climbs:
-#
-#   stage 0  🥚  level 1–3
-#   stage 1  🦊  level 4–7
-#   stage 2  🔥  level 8–12
-#   stage 3  🐉  level 13+ (maxed)
-#
-# XP spans: level N lives between (N-1)*100 and N*100.
-#   * To reach level 2 you need 100 XP.
-#   * To reach level 5 you need 400 XP.
-#   * So at level 4 with 350 XP, you're 50% through the level
-#     and 50 XP away from level 5.
-#
-# Two fields are exposed so the client never has to do math:
-#
-#   * `xp_to_next`     — remaining XP until the next level (50)
-#   * `xp_into_level`  — XP earned inside the current level (50)
-#   * `level_xp_span`  — total XP the current level requires (100)
+# Moved to gamification.py so the catalog (emoji, traits, stages)
+# lives in exactly one place. Kept here as a thin wrapper so any old
+# imports keep working.
 
 def get_pet_evolution_data(
     pet_type: str,
     level: int,
     current_xp: int,
 ) -> dict:
-    evolution_lines = {
-        'nova': ['🥚', '🦊', '🔥', '🐉'],
-        'pip':  ['🥚', '🐧', '🦅', '🦅'],
-        'luna': ['🧶', '🐱', '🐈‍⬛', '🐈‍⬛'],
-        'zap':  ['🔋', '🐶', '⚡', '⚡'],
-    }
-
-    line = evolution_lines.get(
-        pet_type.lower(),
-        ['🥚', '✨', '🌟', '💫'],
-    )
-
-    # ---- Stage from level ----
-    if level <= 3:
-        stage = 0
-    elif level <= 7:
-        stage = 1
-    elif level <= 12:
-        stage = 2
-    else:
-        stage = 3
-
-    is_maxed = stage == 3
-
-    # ---- Maxed pets have nothing left to unlock ----
-    if is_maxed:
-        return {
-            "current_emoji": line[stage],
-            "next_emoji": line[stage],
-            "progress_percent": 1.0,
-            "is_maxed": True,
-            "xp_to_next": 0,
-            "xp_into_level": 0,
-            "level_xp_span": 0,
-        }
-
-    # ---- Progress within the current level ----
-    # level N spans [(N-1)*100, N*100]. The span is always 100,
-    # but keeping it as a subtraction documents the intent.
-    level_floor = (level - 1) * 100
-    level_ceil = level * 100
-    span = level_ceil - level_floor
-
-    xp_into_level = max(0, current_xp - level_floor)
-    progress_percent = min(xp_into_level / span, 1.0)
-    xp_to_next = max(0, level_ceil - current_xp)
-
-    return {
-        "current_emoji": line[stage],
-        "next_emoji": line[stage + 1],
-        "progress_percent": progress_percent,
-        "is_maxed": False,
-        "xp_to_next": xp_to_next,
-        "xp_into_level": xp_into_level,
-        "level_xp_span": span,
-    }
+    from gamification import evolution_data
+    return evolution_data(pet_type, level, current_xp)

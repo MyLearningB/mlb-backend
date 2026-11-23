@@ -15,8 +15,6 @@ from sqlmodel import Session, select
 
 from database import get_session
 from models import (
-    DailyActivity,
-    Pet,
     PlanSubject,
     StudyPlan,
     StudySession,
@@ -49,6 +47,7 @@ from ai_service import (
     generate_gemini_study_plan,
 )
 from routers.auth import limiter
+from gamification import award_xp
 from utils import (
     get_local_now,
     persona_defaults,
@@ -1145,52 +1144,24 @@ def complete_session(
     db_session.completed = True
     session.add(db_session)
 
-    xp_gained = db_session.duration_mins
-
-    pet = session.exec(
-        select(Pet).where(Pet.user_id == current_user.id)
-    ).first()
-
-    if pet:
-        pet.xp += xp_gained
-        session.add(pet)
-
-    local_today_date = get_local_now(x_timezone).date()
-    local_today = local_today_date.isoformat()
-
-    daily_activity = session.exec(
-        select(DailyActivity).where(
-            DailyActivity.user_id == current_user.id,
-            DailyActivity.date == local_today,
-        )
-    ).first()
-
-    if daily_activity:
-        daily_activity.xp_earned += xp_gained
-        daily_activity.study_time_mins += db_session.duration_mins
-    else:
-        daily_activity = DailyActivity(
-            user_id=current_user.id,
-            date=local_today,
-            xp_earned=xp_gained,
-            study_time_mins=db_session.duration_mins,
-        )
-    session.add(daily_activity)
-
-    if current_user.last_active_date != local_today_date:
-        yesterday = local_today_date - timedelta(days=1)
-
-        if current_user.last_active_date == yesterday:
-            current_user.current_streak += 1
-        else:
-            current_user.current_streak = 1
-
-        if current_user.current_streak > current_user.longest_streak:
-            current_user.longest_streak = current_user.current_streak
-
-        current_user.last_active_date = local_today_date
-        session.add(current_user)
+    # One minute studied = one base XP (capped so a giant manual
+    # session can't farm XP). award_xp adds the pet's trait bonus,
+    # levels the pet up, updates the streak and co-op quests.
+    minutes = min(db_session.duration_mins or 0, 180)
+    reward = award_xp(
+        session,
+        current_user,
+        minutes,
+        local_now=get_local_now(x_timezone),
+        source="plan_session",
+        duration_mins=minutes,
+        minutes_studied=minutes,
+    )
 
     session.commit()
 
-    return {"message": "Session completed!", "xp_gained": xp_gained}
+    return {
+        "message": "Session completed!",
+        "xp_gained": reward["xp_earned"],
+        "reward": reward,
+    }

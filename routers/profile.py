@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status
-from sqlmodel import Session, select
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Header, status
+from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date, datetime, timedelta
@@ -7,10 +7,13 @@ from datetime import date, datetime, timedelta
 # Import your existing project dependencies
 from database import get_session
 from security import get_current_user
-from models import User, Pet, DailyActivity, StudySession, Quest, Reminder, Flashcard, StudySet, Feedback
+from models import (
+    User, Pet, DailyActivity, StudySession, Quest, Reminder, Flashcard,
+    StudySet, Feedback, FeynmanSession,
+)
 
-# NEW: Import the evolution math
-from utils import get_pet_evolution_data
+from gamification import get_pet, pet_view, streak_view, xp_history_last_7
+from utils import get_local_now
 
 router = APIRouter()
 
@@ -84,83 +87,55 @@ class FeedbackRequest(BaseModel):
 def get_profile(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
 ):
-    """Returns full user profile + pet + streak + stats"""
+    """Returns full user profile + pet + streak + stats.
 
-    # 1. Pet Data
-    pet = session.exec(select(Pet).where(Pet.user_id == current_user.id)).first()
+    Pet and streak come from gamification.py — the exact same numbers
+    the dashboard shows.
+    """
+    today = get_local_now(x_timezone).date()
 
-    pet_type = pet.pet_type if pet else "nova"
-    pet_level = pet.level if pet else 1
-    pet_xp = pet.xp if pet else 0
-    pet_name = pet.pet_name if pet else "Nova"
-    pet_mood = getattr(pet, "mood", "happy") if pet else "happy"
+    pet = get_pet(session, current_user.id)
+    pet_data = pet_view(
+        pet,
+        current_user,
+        today,
+        xp_history_last_7(session, current_user.id, today),
+    )
+    streak = streak_view(current_user, today)
 
-    pet_data = {
-        "name": pet_name,
-        "type": pet_type,
-        "level": pet_level,
-        "xp": pet_xp,
-        "mood": pet_mood,
-        "xp_history": [0, 0, 0, 0, 0, 0, 0],
-    }
-
-    # Merge the dynamic UI fields
-    pet_data.update(get_pet_evolution_data(pet_type, pet_level, pet_xp))
-
-    # 2. Optimized Streak Data (O(1) lookup)
-    today = datetime.now().date()
-    yesterday = today - timedelta(days=1)
-
-    is_streak_alive = current_user.last_active_date in (today, yesterday)
-    display_current_streak = current_user.current_streak if is_streak_alive else 0
-
-    # 3. Stats Data
     quests_won = session.exec(
-        select(Quest).where(
+        select(func.count(Quest.id)).where(
             Quest.user_id == current_user.id,
             Quest.progress >= Quest.target,
         )
-    ).all()
+    ).one()
 
-    completed_sessions = session.exec(
-        select(StudySession).where(
-            StudySession.user_id == current_user.id,
-            StudySession.completed == True,
+    total_study_minutes = session.exec(
+        select(func.coalesce(func.sum(DailyActivity.study_time_mins), 0)).where(
+            DailyActivity.user_id == current_user.id,
         )
-    ).all()
-    total_study_minutes = sum(s.duration_mins for s in completed_sessions)
+    ).one()
 
-    # Calculate real mastered cards (cards that are NOT marked as weak)
     mastered_cards = session.exec(
-        select(Flashcard)
-        .join(StudySet)
+        select(func.count(Flashcard.id))
+        .join(StudySet, StudySet.id == Flashcard.study_set_id)
         .where(
             StudySet.user_id == current_user.id,
-            Flashcard.is_weak == False,
+            Flashcard.is_weak == False,  # noqa: E712
         )
-    ).all()
+    ).one()
 
-    # Fetch actual recent activity (Last 5 completed sessions)
     recent_activity_query = session.exec(
         select(StudySession)
         .where(
             StudySession.user_id == current_user.id,
-            StudySession.completed == True,
+            StudySession.completed == True,  # noqa: E712
         )
         .order_by(StudySession.date.desc())
         .limit(5)
     ).all()
-
-    recent_activity_list = [
-        {
-            "subject": s.subject,
-            "mode": s.mode,
-            "duration": s.duration_mins,
-            "date": s.date,
-        }
-        for s in recent_activity_query
-    ]
 
     return {
         "user": {
@@ -168,18 +143,32 @@ def get_profile(
             "display_name": current_user.name,
             "bio": current_user.bio,
             "avatar_url": None,
+            "goal_type": current_user.goal_type,
+            "study_goal": current_user.study_goal,
+            "target_date": current_user.target_date,
+            "daily_goal_mins": current_user.daily_goal_mins,
         },
+        "has_pet": pet is not None,
         "pet": pet_data,
         "streak": {
-            "days": display_current_streak,
-            "longest_ever": current_user.longest_streak,
+            "days": streak["days"],
+            "active_today": streak["active_today"],
+            "longest_ever": streak["longest"],
         },
         "stats": {
-            "quests_won": len(quests_won),
-            "cards_mastered": len(mastered_cards),
-            "total_study_hours": round(total_study_minutes / 60.0, 1),
+            "quests_won": quests_won,
+            "cards_mastered": mastered_cards,
+            "total_study_hours": round((total_study_minutes or 0) / 60.0, 1),
         },
-        "recent_activity": recent_activity_list,
+        "recent_activity": [
+            {
+                "subject": s.subject,
+                "mode": s.mode,
+                "duration": s.duration_mins,
+                "date": s.date,
+            }
+            for s in recent_activity_query
+        ],
     }
 
 @router.patch("/profile", status_code=status.HTTP_200_OK)
@@ -240,29 +229,30 @@ def upload_avatar(
 def get_analytics(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
 ):
-    """Weekly chart + streak calendar"""
-    today = datetime.now().date()
+    """Weekly chart + streak calendar (user's local days)."""
+    today = get_local_now(x_timezone).date()
 
     # 1. Weekly Chart (Last 7 Days)
     last_7_dates = [
         (today - timedelta(days=i)).isoformat() for i in range(6, -1, -1)
     ]
-    recent_sessions = session.exec(
-        select(StudySession).where(
-            StudySession.user_id == current_user.id,
-            StudySession.date.in_(last_7_dates),
-            StudySession.completed == True,
+    # Minutes come from DailyActivity, which now records plan sessions,
+    # flashcards AND Feynman time (award_xp), not just plan sessions.
+    week_activities = session.exec(
+        select(DailyActivity).where(
+            DailyActivity.user_id == current_user.id,
+            DailyActivity.date.in_(last_7_dates),
         )
     ).all()
+    week_minutes = {a.date: a.study_time_mins or 0 for a in week_activities}
 
     weekly_chart = []
     for i in range(6, -1, -1):
         target_date = today - timedelta(days=i)
         target_date_str = target_date.isoformat()
-        day_mins = sum(
-            s.duration_mins for s in recent_sessions if s.date == target_date_str
-        )
+        day_mins = week_minutes.get(target_date_str, 0)
         weekly_chart.append({
             "day": target_date.strftime("%a"),
             "date": target_date_str,
@@ -292,7 +282,7 @@ def get_analytics(
             "date": target_date_str,
             "studied": bool(act and act.xp_earned > 0),
             "session_count": 1 if (act and act.xp_earned > 0) else 0,
-            "total_minutes": 0,
+            "total_minutes": (act.study_time_mins or 0) if act else 0,
         })
 
     return {
@@ -481,13 +471,31 @@ def delete_account(
         reminders = session.exec(select(Reminder).where(Reminder.user_id == user_id)).all()
         for r in reminders: session.delete(r)
 
-        # Delete StudySets and their associated Flashcards
+        # Feynman sessions FIRST — their card_id is NOT NULL, so deleting
+        # cards before them makes the ORM try to null it and crash.
+        feynman = session.exec(
+            select(FeynmanSession).where(FeynmanSession.user_id == user_id)
+        ).all()
+        for fs in feynman: session.delete(fs)
+        session.flush()
+
+        # Delete StudySets and their Flashcards.
+        # FIX: was `Flashcard.set_id`, which doesn't exist — every account
+        # deletion crashed with a 500.
         study_sets = session.exec(select(StudySet).where(StudySet.user_id == user_id)).all()
         for s_set in study_sets:
-            # Delete flashcards linked to this set first to avoid orphan errors
-            cards = session.exec(select(Flashcard).where(Flashcard.set_id == s_set.id)).all()
+            for fs in session.exec(
+                select(FeynmanSession).where(FeynmanSession.study_set_id == s_set.id)
+            ).all():
+                session.delete(fs)
+            session.flush()
+            cards = session.exec(
+                select(Flashcard).where(Flashcard.study_set_id == s_set.id)
+            ).all()
             for card in cards: session.delete(card)
+            session.flush()
             session.delete(s_set)
+        session.flush()
 
         # Delete Feedback
         feedbacks = session.exec(select(Feedback).where(Feedback.user_id == user_id)).all()

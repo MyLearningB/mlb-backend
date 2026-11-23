@@ -818,6 +818,11 @@ class FeynmanSession(SQLModel, table=True):
         default="[]",
     )
 
+    # NEW — XP for a Feynman session is granted exactly once.
+    xp_awarded: bool = Field(
+        default=False,
+    )
+
     created_at: datetime = Field(
         default_factory=utc_now,
     )

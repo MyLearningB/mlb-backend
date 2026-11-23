@@ -37,10 +37,8 @@ from database import (
 
 from models import (
     User,
-    Pet,
     StudyPlan,
     StudySession,
-    DailyActivity,
     Quest,
     Feedback,
 )
@@ -56,7 +54,6 @@ from security import get_current_user
 # ============================================================
 
 from schemas import (
-    PetAdoptionRequest,
     DashboardResponse,
     UserDashboardInfo,
     PetDashboardInfo,
@@ -93,6 +90,7 @@ from routers import (
     community,
     notes,
     notifications,
+    onboarding,
     plan,
     profile,
     study,
@@ -100,10 +98,16 @@ from routers import (
 )
 
 from routers.auth import limiter
+from routers.onboarding import onboarding_step
+from gamification import (
+    get_pet,
+    pet_view,
+    streak_view,
+    xp_history_last_7,
+)
 from utils import (
     ALLOWED_GOAL_TYPES,
     get_local_now,
-    get_pet_evolution_data,
 )
 
 
@@ -198,6 +202,9 @@ app.include_router(notifications.router)
 app.include_router(community.router)
 app.include_router(trophies.router)
 
+# Onboarding state, pet catalog, adopt + rename pet
+app.include_router(onboarding.router)
+
 # Study plan (generate / approve / adjust / complete)
 app.include_router(plan.router)
 
@@ -280,6 +287,7 @@ def update_study_profile(
     request: StudyProfileUpdate,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
 ):
     if request.goal_type is not None:
         if request.goal_type not in ALLOWED_GOAL_TYPES:
@@ -290,10 +298,22 @@ def update_study_profile(
         current_user.goal_type = request.goal_type
 
     if request.study_goal is not None:
-        current_user.study_goal = request.study_goal
+        goal = request.study_goal.strip()
+        current_user.study_goal = goal[:200] or None
 
     if request.target_date is not None:
+        if request.target_date < get_local_now(x_timezone).date():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Target date can't be in the past.",
+            )
         current_user.target_date = request.target_date
+
+    if request.clear_target_date:
+        current_user.target_date = None
+
+    if request.daily_goal_mins is not None:
+        current_user.daily_goal_mins = request.daily_goal_mins
 
     session.add(current_user)
     try:
@@ -310,91 +330,13 @@ def update_study_profile(
         "goal_type": current_user.goal_type,
         "study_goal": current_user.study_goal,
         "target_date": current_user.target_date,
+        "daily_goal_mins": current_user.daily_goal_mins,
     }
 
 
 # ============================================================
-# PET ADOPTION
+# PET ADOPTION — moved to routers/onboarding.py
 # ============================================================
-
-@app.post(
-    "/users/me/pet",
-    status_code=status.HTTP_200_OK,
-)
-def adopt_pet(
-    pet_data: PetAdoptionRequest,
-    current_user: User = Depends(get_current_user),
-    session: Session = Depends(get_session),
-):
-    if not current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid user session.",
-        )
-
-    pet_name = pet_data.pet_name.strip()
-
-    if not pet_name:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Pet name cannot be empty.",
-        )
-
-    if len(pet_name) > 20:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Pet name cannot exceed 20 characters.",
-        )
-
-    allowed_pet_types = {"nova", "pip", "luna", "zap"}
-
-    if pet_data.pet_type not in allowed_pet_types:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid pet type.",
-        )
-
-    existing_pet = session.exec(
-        select(Pet).where(Pet.user_id == current_user.id)
-    ).first()
-
-    if existing_pet:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Already adopted!",
-        )
-
-    new_pet = Pet(
-        user_id=current_user.id,
-        pet_type=pet_data.pet_type,
-        pet_name=pet_name,
-    )
-
-    session.add(new_pet)
-
-    current_user.is_first_session = False
-    session.add(current_user)
-
-    try:
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not save your buddy. Please try again.",
-        )
-
-    session.refresh(new_pet)
-    session.refresh(current_user)
-
-    return {
-        "pet_id": new_pet.id,
-        "pet_type": new_pet.pet_type,
-        "pet_name": new_pet.pet_name,
-        "level": new_pet.level,
-        "xp": new_pet.xp,
-        "is_first_session": current_user.is_first_session,
-    }
 
 
 # ============================================================
@@ -435,80 +377,24 @@ def get_dashboard(
     today = local_now.date()
     today_str = today.isoformat()
 
-    last_7_days = [
-        (today - timedelta(days=i)).isoformat()
-        for i in range(6, -1, -1)
-    ]
-
-    activities = session.exec(
-        select(DailyActivity).where(
-            DailyActivity.user_id == current_user.id,
-            DailyActivity.date.in_(last_7_days),
-        )
-    ).all()
-
-    xp_map = {a.date: a.xp_earned for a in activities}
-
-    real_xp_history = [xp_map.get(day, 0) for day in last_7_days]
-
-    streak_active = xp_map.get(today_str, 0) > 0
-
-    sixty_days_ago = (today - timedelta(days=60)).isoformat()
-
-    all_active_dates = session.exec(
-        select(DailyActivity.date)
-        .where(
-            DailyActivity.user_id == current_user.id,
-            DailyActivity.xp_earned > 0,
-            DailyActivity.date >= sixty_days_ago,
-        )
-        .distinct()
-        .order_by(DailyActivity.date.desc())
-    ).all()
-
-    streak_count = 0
-    check_date = today
-
-    if not streak_active:
-        check_date -= timedelta(days=1)
-
-    for active_date_str in all_active_dates:
-        if active_date_str == check_date.isoformat():
-            streak_count += 1
-            check_date -= timedelta(days=1)
-        elif active_date_str > check_date.isoformat():
-            continue
-        else:
-            break
-
+    # ---- Streak: one implementation (gamification.streak_view),
+    #      the same numbers the profile screen shows.
+    streak = streak_view(current_user, today)
     streak_info = StreakInfo(
-        days=streak_count,
-        active_today=streak_active,
+        days=streak["days"],
+        active_today=streak["active_today"],
     )
 
-    pet = session.exec(
-        select(Pet).where(Pet.user_id == current_user.id)
-    ).first()
-
-    pet_type = pet.pet_type if pet else "nova"
-    pet_level = pet.level if pet else 1
-    pet_xp = pet.xp if pet else 0
-    pet_name = pet.pet_name if pet else "Nova"
-    pet_mood = getattr(pet, "mood", "happy") if pet else "happy"
-
-    evolution_data = get_pet_evolution_data(pet_type, pet_level, pet_xp)
-
-    pet_info_dict = {
-        "name": pet_name,
-        "type": pet_type,
-        "level": pet_level,
-        "xp": pet_xp,
-        "mood": pet_mood,
-        "xp_history": real_xp_history if pet else [0] * 7,
-        **evolution_data,
-    }
-
-    pet_info = PetDashboardInfo(**pet_info_dict)
+    # ---- Pet: level, evolution, mood and trait from one place ----
+    pet = get_pet(session, current_user.id)
+    pet_info = PetDashboardInfo(
+        **pet_view(
+            pet,
+            current_user,
+            today,
+            xp_history_last_7(session, current_user.id, today),
+        )
+    )
 
     plans_by_id = {
         p.id: p
@@ -578,6 +464,9 @@ def get_dashboard(
         goal_type=current_user.goal_type,
         study_goal=current_user.study_goal,
         target_date=current_user.target_date,
+        daily_goal_mins=current_user.daily_goal_mins,
+        onboarding_step=onboarding_step(session, current_user),
+        has_pet=pet is not None,
     )
 
 
