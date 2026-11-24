@@ -1,108 +1,49 @@
 import json
-import uuid
 import os
 import traceback
-from dotenv import load_dotenv
-from datetime import date, datetime, timedelta
+import uuid
+from datetime import date
 from typing import List, Optional
-from openai import AsyncOpenAI
+
+from dotenv import load_dotenv
+from openai import AsyncOpenAI, Timeout
 
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-gemini-api-key-here")
 
-# Point the OpenAI client to the Gemini API endpoint
+SOLVE_MODEL = os.getenv("SOLVE_AI_MODEL", "gemini-3.8-flash")
+PLAN_MODEL = os.getenv("PLAN_AI_MODEL", "gemini-3.8-flash")
+
+# Point the OpenAI client to the Gemini API endpoint.
+# The timeout stops a hung request from holding a worker forever.
 client = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    timeout=Timeout(75, connect=10),
+    max_retries=1,
 )
 
 
 # ==========================================
-# CANONICAL VALUES
+# PERSONA HINTS (a guide only — never a limit)
 # ==========================================
-
-VALID_MODES = {"review", "flashcard", "feynman"}
-VALID_PRIORITIES = {"normal", "high", "weak_area"}
-VALID_SESSION_TYPES = {"study", "review", "rest"}
-
-_MODE_ALIASES = {
-    "review": "review",
-    "reviews": "review",
-    "revision": "review",
-    "revise": "review",
-    "flashcard": "flashcard",
-    "flashcards": "flashcard",
-    "flash card": "flashcard",
-    "flash cards": "flashcard",
-    "feynman": "feynman",
-    "feynman technique": "feynman",
-}
-
-_PRIORITY_ALIASES = {
-    "normal": "normal",
-    "medium": "normal",
-    "regular": "normal",
-    "standard": "normal",
-    "high": "high",
-    "urgent": "high",
-    "important": "high",
-    "weak_area": "weak_area",
-    "weak area": "weak_area",
-    "weak": "weak_area",
-    "weakness": "weak_area",
-}
-
-
-def _normalize_mode(value) -> str:
-    if not isinstance(value, str):
-        return "review"
-    return _MODE_ALIASES.get(value.strip().lower(), "review")
-
-
-def _normalize_priority(value) -> str:
-    if not isinstance(value, str):
-        return "normal"
-    key = value.strip().lower().replace("_", " ")
-    return _PRIORITY_ALIASES.get(key, "normal")
-
-
-def _normalize_session_type(value) -> str:
-    if not isinstance(value, str):
-        return "study"
-    v = value.strip().lower()
-    return v if v in VALID_SESSION_TYPES else "study"
-
-
-# ==========================================
-# PERSONA HINTS
-# ==========================================
+#
+# The onboarding answer (goal_type) only sets tone and session
+# style. The GOAL text decides what the plan is about, so a
+# university student can still plan chess or knitting.
 
 PERSONA_HINTS = {
-    "university": (
-        "The student is at university. Use exam-focused language and "
-        "prioritise deep understanding. Recommend 45–90 minute sessions, "
-        "past papers, and spaced repetition. Assume they can handle dense "
-        "topics in a single sitting."
-    ),
-    "professional": (
-        "The user is a working professional preparing for a certification "
-        "(ACCA, CFA, ICAN, PMP, etc.). Recommend 30–60 minute sessions, "
-        "early-morning or evening slots, and tie every topic back to the "
-        "exam syllabus objectives. Assume limited weekday time."
-    ),
-    "high_school": (
-        "The student is preparing for WAEC, JAMB, or NECO. Use exam-board "
-        "language. Prioritise past-question practice and shorter, more "
-        "frequent sessions (25–40 minutes). Reinforce fundamentals and "
-        "common exam traps."
-    ),
-    "self_improvement": (
-        "The user is a casual, self-directed learner — chess, a new "
-        "language, guitar, coding for fun. Keep sessions short and varied "
-        "(20–40 minutes), project- or practice-based, and low-pressure. "
-        "Alternate between theory and hands-on practice."
-    ),
+    "university": "The learner is a university student: comfortable with dense material and longer sessions.",
+    "professional": "The learner is a working professional: limited weekday time, values efficiency and real-world relevance.",
+    "high_school": "The learner is a secondary-school student: keep language simple, tasks bite-sized, lots of past-question practice for exams.",
+    "self_improvement": "The learner is a self-directed learner: keep it encouraging, hands-on and low-pressure.",
+}
+
+LEVEL_HINTS = {
+    "beginner": "They are starting from zero — begin with fundamentals and tools.",
+    "intermediate": "They know the basics — skip absolute fundamentals, focus on depth and practice.",
+    "advanced": "They are advanced — focus on weak spots, hard material and timed/real-world practice.",
 }
 
 
@@ -147,7 +88,7 @@ async def generate_gemini_solution(question_text: str) -> Optional[dict]:
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-3.8-flash",
+            model=SOLVE_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Solve this: {question_text}"},
@@ -203,628 +144,191 @@ async def generate_gemini_solution(question_text: str) -> Optional[dict]:
         return None
 
 
+
 # ==========================================
-# 2. AI PHASE SKELETON GENERATOR
+# 2. STUDY PLAN ROADMAP (one call per plan)
 # ==========================================
+#
+# This is the ONLY AI call a new plan makes. It returns a curriculum
+# (phases -> units -> concrete tasks). plan_scheduler.py then spreads
+# it over the calendar with no further AI cost. The output is checked
+# and repaired by plan_scheduler.normalize_roadmap().
 
-MIN_PHASE_WEEKS = 2
-MIN_PHASES = 2
-MAX_PHASES = 6
+def _units_target(total_weeks: int) -> tuple[int, int]:
+    """(min_units, max_units) — about one unit per week, capped for long plans."""
+    if total_weeks <= 2:
+        return 2, 5
+    if total_weeks <= 12:
+        return max(3, total_weeks - 2), total_weeks + 2
+    if total_weeks <= 52:
+        return 12, 30
+    return 20, 36
 
 
-async def generate_gemini_phase_plan(
+def _json_from(response) -> Optional[dict]:
+    text = response.choices[0].message.content or ""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except (ValueError, TypeError):
+            return None
+    return data if isinstance(data, dict) else None
+
+
+async def generate_plan_roadmap(
     goal: str,
-    goal_type: Optional[str],
+    *,
+    kind_hint: str,
+    level: str,
     total_weeks: int,
-    minutes_per_day: Optional[int] = None,
-    study_days_per_week: Optional[int] = None,
-    progress_summary: Optional[str] = None,
-) -> Optional[dict]:
-    """
-    Generate a 2–6 phase skeleton spanning `total_weeks`.
-    """
-
-    if total_weeks < MIN_PHASE_WEEKS:
-        return None
-
-    today_str = date.today().isoformat()
-
-    persona_block = PERSONA_HINTS.get(
-        goal_type or "",
-        "The user's background is unspecified — keep sessions moderate "
-        "length and balanced between theory and practice.",
-    )
-
-    availability_line = ""
-    if minutes_per_day and study_days_per_week:
-        availability_line = (
-            f"They can study {minutes_per_day} minutes/day, "
-            f"{study_days_per_week} days/week."
-        )
-
-    rebase_block = ""
-    if progress_summary:
-        rebase_block = f"""
-        IMPORTANT — this is a REBASE, not the initial plan.
-        The user has already completed part of the arc. Replan the
-        REMAINING {total_weeks} weeks based on:
-        {progress_summary}
-        Compress anything they've already mastered. Expand anything
-        they struggled with.
-        """
-
-    system_prompt = f"""
-    You are myLB AI, an expert curriculum architect.
-    The user is preparing for "{goal}" over the next {total_weeks} weeks.
-    Today is {today_str}.
-
-    LEARNER PROFILE:
-    {persona_block}
-
-    {availability_line}
-    {rebase_block}
-
-    Produce between {MIN_PHASES} and {MAX_PHASES} contiguous phases
-    covering weeks 1 through {total_weeks}. Phase boundaries are
-    inclusive: phase 1 might be weeks 1–4, phase 2 weeks 5–11, etc.
-    They must not overlap and must have no gaps.
-
-    A good arc front-loads foundations, spends the middle on depth
-    and structured practice, and ends with full-length practice and
-    a short taper. Longer spans naturally split into more phases —
-    do not force the same shape for 13 weeks as for 34 weeks.
-
-    You MUST respond in valid JSON:
-    {{
-      "phases": [
-        {{
-          "name": "Diagnostic & Foundations",
-          "start_week": 1,
-          "end_week": 4,
-          "focus": ["baseline test", "arithmetic", "algebra basics"],
-          "milestone": "Complete diagnostic and log weak areas"
-        }}
-      ],
-      "total_weeks": {total_weeks}
-    }}
-
-    Rules:
-    - 'start_week' of the first phase must be 1.
-    - 'end_week' of the last phase must be {total_weeks}.
-    - Each phase's start_week must equal previous phase's end_week + 1.
-    - 'focus' should be 3–6 short topic strings, not sentences.
-    - 'milestone' is one concrete measurable checkpoint.
-    """
-
-    try:
-        response = await client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Build my {total_weeks}-week phase plan for {goal}.",
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        data = json.loads(response.choices[0].message.content)
-
-        raw_phases = data.get("phases")
-        if not isinstance(raw_phases, list):
-            return None
-
-        clean_phases = []
-        for raw in raw_phases:
-            if not isinstance(raw, dict):
-                continue
-            try:
-                start = int(raw.get("start_week") or 0)
-                end = int(raw.get("end_week") or 0)
-            except (TypeError, ValueError):
-                continue
-            if start < 1 or end < start or end > total_weeks:
-                continue
-
-            focus = raw.get("focus") or []
-            if not isinstance(focus, list):
-                focus = []
-            focus = [str(f).strip() for f in focus if str(f).strip()][:6]
-
-            clean_phases.append(
-                {
-                    "name": str(raw.get("name") or "Phase").strip()[:60],
-                    "start_week": start,
-                    "end_week": end,
-                    "focus": focus,
-                    "milestone": str(raw.get("milestone") or "").strip()[:200],
-                }
-            )
-
-        if not clean_phases:
-            return None
-
-        clean_phases.sort(key=lambda p: p["start_week"])
-
-        if clean_phases[0]["start_week"] != 1:
-            clean_phases[0]["start_week"] = 1
-
-        if clean_phases[-1]["end_week"] != total_weeks:
-            clean_phases[-1]["end_week"] = total_weeks
-
-        for i in range(1, len(clean_phases)):
-            expected_start = clean_phases[i - 1]["end_week"] + 1
-            if clean_phases[i]["start_week"] != expected_start:
-                clean_phases[i]["start_week"] = expected_start
-
-        clean_phases = [
-            p for p in clean_phases
-            if p["end_week"] >= p["start_week"]
-        ]
-
-        if not clean_phases:
-            return None
-
-        if len(clean_phases) > MAX_PHASES:
-            clean_phases = clean_phases[:MAX_PHASES]
-            clean_phases[-1]["end_week"] = total_weeks
-
-        return {
-            "phases": clean_phases,
-            "total_weeks": total_weeks,
-        }
-
-    except Exception as e:
-        print(f"Gemini Phase Plan Error: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ==========================================
-# 3. AI WINDOW GENERATOR (LEGACY single-subject)
-# ==========================================
-
-async def generate_gemini_study_plan(
-    goal: str,
-    target_date: Optional[date] = None,
-    days_remaining: Optional[int] = None,
-    goal_type: Optional[str] = None,
-    window_start: Optional[date] = None,
-    window_days: int = 7,
-    phase_context: Optional[dict] = None,
-    recent_topics: Optional[List[str]] = None,
-    recent_skips: Optional[List[str]] = None,
-    pace_feedback: Optional[str] = None,
-    minutes_per_day: Optional[int] = None,
-    study_days_per_week: Optional[int] = None,
-) -> Optional[dict]:
-    """
-    Generate sessions for a single window (default 7 days).
-    """
-    if window_start is None:
-        window_start = date.today()
-
-    today_str = window_start.isoformat()
-    window_end = window_start + timedelta(days=window_days - 1)
-
-    if target_date and days_remaining is not None:
-        context_prompt = (
-            f"Their deadline is in {days_remaining} days "
-            f"({target_date.isoformat()}). Escalate intensity as the "
-            f"deadline approaches."
-        )
-    else:
-        context_prompt = (
-            "They are learning continuously without a strict deadline. "
-            "Build a sustainable, consistent routine."
-        )
-
-    persona_block = PERSONA_HINTS.get(
-        goal_type or "",
-        "Keep sessions moderate length and balanced between theory and practice.",
-    )
-
-    phase_block = ""
-    if phase_context:
-        focus_str = ", ".join(phase_context.get("focus", []))
-        phase_block = f"""
-        CURRENT PHASE:
-          Name: {phase_context.get("name", "Current phase")}
-          Focus: {focus_str}
-          Milestone: {phase_context.get("milestone", "")}
-
-        Only schedule topics that serve this focus. Do not introduce
-        topics from future phases.
-        """
-
-    history_block = ""
-    if recent_topics:
-        history_block += (
-            "RECENT TOPICS (past 14 days):\n"
-            + "\n".join(f"  - {t}" for t in recent_topics[:20])
-            + "\nDo NOT repeat these unless it's an explicit review.\n"
-        )
-    if recent_skips:
-        history_block += (
-            "SKIPPED BY USER:\n"
-            + "\n".join(f"  - {t}" for t in recent_skips[:10])
-            + "\nReschedule skipped topics EARLY in this window, "
-            "and mark them as weak_area priority.\n"
-        )
-    if pace_feedback:
-        history_block += f"USER PACE FEEDBACK: {pace_feedback}\n"
-
-    availability_block = ""
-    if minutes_per_day and study_days_per_week:
-        availability_block = (
-            f"BUDGET: {minutes_per_day} min/day, "
-            f"{study_days_per_week} days/week. Do not exceed.\n"
-        )
-
-    system_prompt = f"""
-    You are myLB AI, an expert academic planner.
-    The user is studying for "{goal}". {context_prompt}
-
-    WINDOW: {today_str} through {window_end.isoformat()}
-    ({window_days} days).
-
-    LEARNER PROFILE:
-    {persona_block}
-
-    {phase_block}
-    {availability_block}
-    {history_block}
-
-    Generate sessions ONLY within the window above.
-    Include rest days where appropriate.
-
-    You MUST respond in valid JSON:
-    {{
-      "sessions": [
-        {{
-          "date": "YYYY-MM-DD",
-          "time": "16:00",
-          "subject": "Specific topic name",
-          "duration_mins": 30,
-          "mode": "flashcard",
-          "priority": "normal"
-        }}
-      ],
-      "nudge": null
-    }}
-
-    Rules:
-    - 'date' must be between {today_str} and {window_end.isoformat()}.
-    - 'mode' must be exactly: "review", "flashcard", or "feynman".
-    - 'priority' must be exactly: "normal", "high", or "weak_area".
-    - 'subject' must name a specific topic, not the overall goal.
-    - Vary modes; do not use the same mode every day.
-    """
-
-    try:
-        response = await client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Generate my next {window_days} days.",
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        plan_data = json.loads(response.choices[0].message.content)
-
-        if not isinstance(plan_data.get("sessions"), list):
-            plan_data["sessions"] = []
-
-        clean_sessions = []
-        for raw in plan_data["sessions"]:
-            if not isinstance(raw, dict):
-                continue
-
-            date_str = str(raw.get("date") or "").strip()
-
-            try:
-                s_date = date.fromisoformat(date_str)
-            except ValueError:
-                continue
-            if not (window_start <= s_date <= window_end):
-                continue
-
-            subject = str(raw.get("subject") or goal).strip() or goal
-            time_str = str(raw.get("time") or "16:00").strip()
-
-            try:
-                duration = int(raw.get("duration_mins") or 30)
-            except (TypeError, ValueError):
-                duration = 30
-            if duration <= 0:
-                duration = 30
-            if duration > 180:
-                duration = 180
-
-            clean_sessions.append(
-                {
-                    "date": date_str,
-                    "time": time_str,
-                    "subject": subject,
-                    "duration_mins": duration,
-                    "mode": _normalize_mode(raw.get("mode")),
-                    "priority": _normalize_priority(raw.get("priority")),
-                }
-            )
-
-        plan_data["sessions"] = clean_sessions
-        plan_data.setdefault("nudge", None)
-        return plan_data
-
-    except Exception as e:
-        print(f"Gemini Window Plan Error: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ==========================================
-# 4. MULTI-SUBJECT WINDOW GENERATOR
-# ==========================================
-
-async def generate_gemini_multisubject_plan(
-    subjects: List[dict],
-    plan_title: str,
-    plan_type: str,
+    has_deadline: bool,
+    minutes_per_day: int,
+    days_per_week: int,
+    session_mins: int,
     goal_type: Optional[str],
-    window_start: date,
-    window_days: int,
-    minutes_per_day: int,
-    study_days_per_week: int,
-    earliest: str = "07:00",
-    latest: str = "22:00",
-    session_length_pref: int = 45,
-    phase_context: Optional[dict] = None,
+    today: date,
     notes: Optional[str] = None,
-    recent_topics: Optional[List[str]] = None,
+    progress_summary: Optional[str] = None,
+    feedback: Optional[str] = None,
 ) -> Optional[dict]:
-    """
-    Schedule a rolling window across N subjects.
-
-    Allocates minutes by:
-      * subject weight (1–5)
-      * exam proximity (escalates hard inside 14 days)
-      * presence of weak_topics (those get weak_area priority
-        and appear early in each block)
-      * total budget: minutes_per_day * study_days_per_week
-    """
-    window_end = window_start + timedelta(days=window_days - 1)
-
-    persona = PERSONA_HINTS.get(
-        goal_type or "",
-        "Keep sessions moderate and balance theory with practice.",
+    """Return the raw roadmap JSON, or None on any failure."""
+    min_u, max_u = _units_target(total_weeks)
+    persona = PERSONA_HINTS.get(goal_type or "", "Learner background unknown — keep it balanced.")
+    level_hint = LEVEL_HINTS.get(level, LEVEL_HINTS["beginner"])
+    span = (
+        f"They must be ready in {total_weeks} weeks (fixed deadline)."
+        if has_deadline
+        else f"No deadline — design a realistic {total_weeks}-week path."
     )
-
-    subject_lines = []
-    for s in subjects:
-        line = (
-            f"- {s['name']} (weight {s['weight']}/5, "
-            f"level {s['current_level']}"
-        )
-        if s.get("exam_date"):
-            line += f", exam {s['exam_date']}"
-        if s.get("topics"):
-            line += f", topics: {', '.join(s['topics'][:8])}"
-        if s.get("weak_topics"):
-            line += f", WEAK: {', '.join(s['weak_topics'][:6])}"
-        line += ")"
-        subject_lines.append(line)
-
-    phase_block = ""
-    if phase_context:
-        phase_block = (
-            f"CURRENT PHASE: {phase_context.get('name', '')} — "
-            f"focus {', '.join(phase_context.get('focus', []))}"
+    long_note = ""
+    if total_weeks > 52:
+        long_note = (
+            "This is a multi-year plan. Give the FIRST phase detailed units (about one "
+            "per 2 weeks); keep later phases coarse (broad units) — they are detailed "
+            "later. Start gently: early phases build habits and fundamentals, "
+            "intensity rises towards the end."
         )
 
-    history_block = ""
-    if recent_topics:
-        history_block = (
-            "RECENT TOPICS (do not repeat unless a review):\n"
-            + "\n".join(f"  - {t}" for t in recent_topics[:20])
+    extra = ""
+    if notes:
+        extra += f"\nLEARNER NOTES (follow them): {notes[:600]}"
+    if progress_summary:
+        extra += (
+            f"\nTHIS IS A RE-PLAN for the REMAINING {total_weeks} weeks. "
+            f"Progress so far: {progress_summary[:800]}. Do not repeat what is done "
+            "unless it needs review."
         )
+    if feedback:
+        extra += f"\nLEARNER FEEDBACK ON THE OLD PLAN (act on it): {feedback[:500]}"
 
-    notes_block = f"USER NOTES: {notes}\n" if notes else ""
+    system_prompt = f"""You are myLB, an expert learning designer. Build a study roadmap for ANY goal:
+exams (known or obscure), school courses, skills (chess, sewing, coding, music) or habits.
 
-    system_prompt = f"""You are myLB AI, an expert academic scheduler.
-
-Plan: "{plan_title}" (type: {plan_type}).
-Window: {window_start.isoformat()} -> {window_end.isoformat()} ({window_days} days).
-Today is {window_start.isoformat()}.
-Budget: {minutes_per_day} min/day, {study_days_per_week} days/week.
-Time-of-day window: {earliest}-{latest}. Prefer {session_length_pref}-min sessions.
-
-LEARNER PROFILE:
+GOAL: "{goal}"
+Today: {today.isoformat()}. {span}
+Time: about {minutes_per_day} min/day, {days_per_week} days/week, sessions of ~{session_mins} min.
 {persona}
+{level_hint}
+{long_note}{extra}
 
-SUBJECTS:
-{chr(10).join(subject_lines)}
+Decide goal_kind:
+- "exam": any test, certification or exam (SAT, GRE, WAEC, ICAN, a uni final, an unknown local exam).
+- "course": working through a school/uni course or syllabus without a single exam focus.
+- "skill": a practical skill or hobby (chess, knitting, guitar, drawing, coding).
+- "habit": a routine to build (read daily, journal, exercise consistency).
 
-{phase_block}
-{history_block}
-{notes_block}
+Rules:
+- 2 to 6 phases in order; each has "weeks" (positive integers summing to {total_weeks}) and one measurable "milestone".
+- Between {min_u} and {max_u} units in total. A unit is a topic or skill block.
+- Each unit has 3 to 5 tasks. A task is ONE concrete thing to do in a single ~{session_mins}-min session,
+  starting with a verb, max 90 characters, measurable where possible.
+  Exam example: "Do 20 SAT linear-equation questions and mark them".
+  Skill example: "Knit 10 rows of garter stitch with even tension".
+- For exams use the real syllabus topics. If you do not know the exam, infer typical content from its name
+  and make the first task "Get the official syllabus for <exam>".
+- Exams end with timed mock practice and a short final review. Skills end with a real project.
+- No dates, no markdown. Short names.
 
-SCHEDULING RULES - these are mandatory:
-1. Distribute sessions across ALL subjects each week - no subject
-   may go more than 3 days without a session unless its exam is
-   >45 days away.
-2. Higher weight -> more minutes. Weight 5 should get roughly 3x
-   the minutes of weight 1.
-3. Exam within 14 days -> double that subject's baseline minutes.
-   Exam within 7 days -> triple.
-4. Topics listed in WEAK for a subject get priority="weak_area"
-   and appear in the first half of each block for that subject.
-5. Respect the budget: {minutes_per_day} min * {study_days_per_week}
-   days / week. Do NOT exceed total weekly minutes.
-6. Rest days are fine - mark them by omitting sessions, not by
-   adding a "rest" session.
-7. Never repeat a topic already in RECENT TOPICS unless marked
-   mode="review".
-8. Sessions must start within {earliest}-{latest}.
-
-RESPOND IN VALID JSON - no markdown, no prose:
-{{
-  "sessions": [
-    {{
-      "date": "YYYY-MM-DD",
-      "time": "HH:MM",
-      "subject_name": "must exactly match one of the subject names above",
-      "topic": "specific sub-topic to study",
-      "duration_mins": 45,
-      "mode": "review" | "flashcard" | "feynman",
-      "priority": "normal" | "high" | "weak_area"
-    }}
-  ]
-}}
-"""
+Respond with JSON only:
+{{"goal_kind":"exam","title":"GRE Prep","emoji":"📝","summary":"one sentence",
+ "phases":[{{"name":"Foundations","weeks":4,"milestone":"Score 150+ on a diagnostic",
+   "units":[{{"title":"Arithmetic & number properties","tasks":["...","...","..."]}}]}}]}}"""
 
     try:
         response = await client.chat.completions.create(
-            model="gemini-3.8-flash",
+            model=PLAN_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Schedule my next {window_days} days.",
-                },
+                {"role": "user", "content": f"Build my roadmap for: {goal}"},
             ],
             response_format={"type": "json_object"},
-            temperature=0.6,
+            temperature=0.5,
         )
-        data = json.loads(response.choices[0].message.content)
-
-        if not isinstance(data.get("sessions"), list):
-            return None
-
-        valid_names = {s["name"] for s in subjects}
-        clean = []
-        for raw in data["sessions"]:
-            if not isinstance(raw, dict):
-                continue
-
-            try:
-                s_date = date.fromisoformat(str(raw.get("date", "")))
-            except (ValueError, TypeError):
-                continue
-            if not (window_start <= s_date <= window_end):
-                continue
-
-            name = str(raw.get("subject_name", "")).strip()
-            if name not in valid_names:
-                name = next(
-                    (v for v in valid_names if v.lower() in name.lower()),
-                    subjects[0]["name"] if subjects else "",
-                )
-            if not name:
-                continue
-
-            try:
-                dur = int(raw.get("duration_mins") or session_length_pref)
-            except (TypeError, ValueError):
-                dur = session_length_pref
-            dur = max(10, min(dur, 180))
-
-            clean.append(
-                {
-                    "date": s_date.isoformat(),
-                    "time": str(raw.get("time") or "16:00"),
-                    "subject_name": name,
-                    "topic": (
-                        str(raw.get("topic") or "").strip() or None
-                    ),
-                    "duration_mins": dur,
-                    "mode": _normalize_mode(raw.get("mode")),
-                    "priority": _normalize_priority(raw.get("priority")),
-                }
-            )
-
-        return {"sessions": clean}
-
+        return _json_from(response)
     except Exception as e:
-        print(f"Gemini Multi-Subject Plan Error: {e}")
+        print(f"Gemini Roadmap Error: {e}")
         traceback.print_exc()
         return None
 
 
 # ==========================================
-# 5. DETERMINISTIC FALLBACK SCHEDULER
+# 3. PHASE REFINEMENT (long plans only)
 # ==========================================
 #
-# If the AI fails twice, we still owe the user a plan they can
-# edit. This builds a reasonable round-robin schedule that:
-#
-#   * respects minutes_per_day and study_days_per_week
-#   * prioritises subjects by (exam proximity + weight)
-#   * tags weak_area priority when the subject has weak_topics
-#   * never generates overlapping times on the same day
+# Multi-year plans start with a coarse roadmap. When the learner
+# reaches a long phase, plan_rollover asks for a detailed unit list
+# for THAT phase only. At most one call per phase (max 6 per plan).
 
-def build_fallback_schedule(
-    subjects: List[dict],
-    window_start: date,
-    window_days: int,
+async def refine_plan_phase(
+    goal: str,
+    *,
+    kind: str,
+    level: str,
+    phase: dict,
+    phase_weeks: int,
     minutes_per_day: int,
-    study_days_per_week: int,
-    session_length_pref: int = 45,
-) -> dict:
-    sessions: List[dict] = []
-    if not subjects:
-        return {"sessions": sessions}
+    done_units: List[str],
+) -> Optional[List[dict]]:
+    """Return a detailed list of units for one phase, or None."""
+    min_u = max(4, min(phase_weeks, 10))
+    max_u = max(min_u, min(phase_weeks + 2, 16))
+    coarse = ", ".join(u.get("title", "") for u in phase.get("units", []))
+    done = ", ".join(done_units[-15:]) or "nothing yet"
+    system_prompt = f"""You are myLB, an expert learning designer.
+Goal: "{goal}" (kind: {kind}, level: {level}).
+Current phase: "{phase.get('name')}" lasting {phase_weeks} weeks, about {minutes_per_day} min/day.
+Phase milestone: {phase.get('milestone') or 'n/a'}.
+Coarse outline for this phase: {coarse}.
+Already covered: {done}.
 
-    def urgency(s: dict) -> float:
-        weight_score = s.get("weight", 3) * 5.0
-        if s.get("exam_date"):
-            try:
-                days = (s["exam_date"] - window_start).days
-            except TypeError:
-                days = 60
-            if days <= 0:
-                return 1000.0  # already past — put at front
-            proximity = max(0, 60 - min(days, 60)) * 2.0
-            return weight_score + proximity
-        return weight_score
+Break this phase into {min_u}-{max_u} detailed units in learning order. Each unit has 3-5 tasks;
+each task is one concrete ~session-sized action starting with a verb, max 90 characters.
 
-    ranked = sorted(subjects, key=urgency, reverse=True)
-    idx = 0
-
-    for offset in range(window_days):
-        # Honour study_days_per_week by skipping rest days.
-        if study_days_per_week < 7 and offset % 7 >= study_days_per_week:
-            continue
-
-        day = window_start + timedelta(days=offset)
-        remaining = minutes_per_day
-        hour = 16
-
-        while remaining >= max(20, session_length_pref // 2):
-            subj = ranked[idx % len(ranked)]
-            dur = min(session_length_pref, remaining)
-            topic_pool = subj.get("weak_topics") or subj.get("topics") or []
-            topic = topic_pool[idx % len(topic_pool)] if topic_pool else None
-
-            sessions.append(
-                {
-                    "date": day.isoformat(),
-                    "time": f"{hour:02d}:00",
-                    "subject_name": subj["name"],
-                    "topic": topic,
-                    "duration_mins": dur,
-                    "mode": "review" if idx % 3 == 0 else "flashcard",
-                    "priority": (
-                        "weak_area" if subj.get("weak_topics") else "normal"
-                    ),
-                }
-            )
-            remaining -= dur
-            hour += 1
-            idx += 1
-
-    return {"sessions": sessions}
+Respond with JSON only: {{"units":[{{"title":"...","tasks":["...","...","..."]}}]}}"""
+    try:
+        response = await client.chat.completions.create(
+            model=PLAN_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Detail this phase."},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.4,
+        )
+        data = _json_from(response)
+        units = data.get("units") if data else None
+        return units if isinstance(units, list) and units else None
+    except Exception as e:
+        print(f"Gemini Refine Error: {e}")
+        traceback.print_exc()
+        return None

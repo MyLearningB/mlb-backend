@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from typing import List, Optional
 
-from sqlalchemy import event
+from sqlalchemy import UniqueConstraint, event
 
 from sqlmodel import SQLModel, Field, Relationship
 
@@ -487,6 +487,38 @@ class StudyPlan(SQLModel, table=True):
     )
 
     # --------------------------------------
+    # FLEXIBLE GOAL PLANS (v2)
+    # --------------------------------------
+    # One AI roadmap per plan; plan_scheduler.py turns it into daily
+    # sessions with no further AI calls.
+
+    # "exam" | "course" | "skill" | "habit" — decided by the AI.
+    goal_kind: Optional[str] = Field(default=None, max_length=20)
+
+    # "beginner" | "intermediate" | "advanced"
+    level: str = Field(default="beginner", max_length=20)
+
+    minutes_per_day: int = Field(default=45, ge=10, le=600)
+
+    # JSON list of ISO weekdays, Mon=1 .. Sun=7
+    days_of_week: str = Field(default="[1,2,3,4,5,6]", max_length=40)
+
+    # JSON list of "HH:MM" (max 3) — one session per time
+    preferred_times: str = Field(default='["18:00"]', max_length=60)
+
+    # The curriculum JSON (see plan_scheduler.normalize_roadmap)
+    roadmap: Optional[str] = Field(default=None)
+
+    # Where the roadmap came from: "ai" | "cache" | "fallback"
+    roadmap_source: Optional[str] = Field(default=None, max_length=20)
+
+    # Day the current roadmap starts (changes on re-plan)
+    roadmap_start: Optional[date] = Field(default=None)
+
+    # Sessions exist up to and including this date
+    scheduled_through: Optional[date] = Field(default=None)
+
+    # --------------------------------------
     # TIMESTAMPS
     # --------------------------------------
 
@@ -571,6 +603,14 @@ class StudySession(SQLModel, table=True):
     skipped: bool = Field(
         default=False,
     )
+
+    # NEW (v2) — the concrete thing to do, e.g.
+    # "Knit 10 rows of garter stitch". `topic` holds the unit title.
+    task: Optional[str] = Field(default=None, max_length=300)
+
+    # "plan" (made by the scheduler) | "manual" (added by the user).
+    # Re-scheduling only replaces "plan" sessions.
+    source: str = Field(default="plan", max_length=10)
 
     plan: Optional["StudyPlan"] = Relationship(
         back_populates="sessions",
@@ -1536,3 +1576,43 @@ class Relic(SQLModel, table=True):
         back_populates="relics",
         link_model=UserRelic,
     )
+
+# ==========================================
+# AI USAGE (per-user daily limits)
+# ==========================================
+
+class AiUsage(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("user_id", "day", "feature", name="uq_aiusage_user_day_feature"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    user_id: int = Field(
+        foreign_key="user.id",
+        ondelete="CASCADE",
+        index=True,
+    )
+
+    day: date = Field(index=True)
+
+    # e.g. "plan" (new plan / re-plan), "plan_refine"
+    feature: str = Field(max_length=30)
+
+    count: int = Field(default=0)
+
+
+# ==========================================
+# ROADMAP CACHE (same goal + level = no new AI call)
+# ==========================================
+
+class PlanRoadmapCache(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    cache_key: str = Field(max_length=200, unique=True, index=True)
+
+    roadmap: str
+
+    hits: int = Field(default=0)
+
+    created_at: datetime = Field(default_factory=utc_now)

@@ -78,6 +78,7 @@ from ai_service import generate_gemini_solution
 # ============================================================
 
 from plan_rollover import plan_rollover_loop
+from plan_service import ensure_user_plans_filled
 
 # ============================================================
 # ROUTERS
@@ -406,14 +407,19 @@ def get_dashboard(
         ).all()
     }
 
+    # Top up plans (pure code, no AI) so today's sessions exist even if
+    # the hourly rollover never ran while the server was asleep.
+    ensure_user_plans_filled(session, current_user.id, today)
+
+    # Done sessions stay visible (ticked) so today's progress is clear.
     today_sessions = session.exec(
         select(StudySession)
         .where(
             StudySession.user_id == current_user.id,
             StudySession.date == today_str,
-            StudySession.completed == False,  # noqa: E712
+            StudySession.skipped == False,  # noqa: E712
         )
-        .order_by(StudySession.id)
+        .order_by(StudySession.time, StudySession.id)
     ).all()
 
     real_today_plan = []
@@ -433,9 +439,12 @@ def get_dashboard(
                 emoji=plan.emoji,
                 color_hex=plan.color_hex,
                 completed=s.completed,
+                time=s.time,
+                task=s.task,
+                skipped=s.skipped,
             )
         )
-        if len(real_today_plan) >= 8:
+        if len(real_today_plan) >= 12:
             break
 
     db_quests = session.exec(

@@ -1,10 +1,10 @@
 from datetime import date, timedelta
-from math import ceil
-from typing import Optional, Tuple
+from typing import List, Optional
 import json
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     Header,
     HTTPException,
@@ -25,27 +25,19 @@ from schemas import (
     PlanApproveRequest,
     PlanArchiveRequest,
     PlanGenerateRequest,
-    PlanGoal,
     PlanListItem,
     PlanListResponse,
+    PlanReplanRequest,
     PlanResponse,
-    PlanStats,
-    PlanSubjectInput,
-    PlanSubjectResponse,
+    PlanScheduleUpdate,
     PlanUpdateRequest,
-    SessionDetail,
     SessionUpdateRequest,
-    WeekDay,
+    UpcomingResponse,
+    UpcomingSession,
     normalize_mode,
     normalize_priority,
 )
 from security import get_current_user
-from ai_service import (
-    build_fallback_schedule,
-    generate_gemini_multisubject_plan,
-    generate_gemini_phase_plan,
-    generate_gemini_study_plan,
-)
 from routers.auth import limiter
 from gamification import award_xp
 from utils import (
@@ -53,6 +45,9 @@ from utils import (
     persona_defaults,
     resolve_goal_type,
 )
+import plan_scheduler as ps
+import plan_service as svc
+from plan_rollover import refine_if_needed
 
 
 router = APIRouter(tags=["Study Plan"])
@@ -62,186 +57,86 @@ router = APIRouter(tags=["Study Plan"])
 # CONSTANTS
 # ============================================================
 
-DEFAULT_WINDOW_DAYS = 7
-DEFAULT_STUDY_DAYS_PER_WEEK = 6
-DEFAULT_MINUTES_PER_DAY = 60
+DEFAULT_MINUTES_PER_DAY = 45
+MAX_ACTIVE_PLANS = 8
 
 
 # ============================================================
-# INTERNAL HELPERS
+# HELPERS
 # ============================================================
 
-def _compute_arc_metadata(
-    db_plan: StudyPlan,
-    local_today: date,
-) -> Tuple[
-    Optional[int],
-    Optional[int],
-    Optional[str],
-    Optional[str],
-]:
-    """Return (total_weeks, current_week, phase_name, phase_milestone)."""
-    if not db_plan.start_date or not db_plan.deadline:
-        return None, None, None, None
-
-    span_days = (db_plan.deadline - db_plan.start_date).days
-    total_weeks = max(1, ceil(span_days / 7))
-    current_week = ((local_today - db_plan.start_date).days // 7) + 1
-    current_week = min(max(current_week, 1), total_weeks)
-
-    phase_name = None
-    phase_milestone = None
-
-    if db_plan.phase_plan:
-        try:
-            phases = json.loads(db_plan.phase_plan).get("phases", [])
-            for p in phases:
-                if p.get("start_week", 0) <= current_week <= p.get("end_week", 0):
-                    phase_name = p.get("name")
-                    phase_milestone = p.get("milestone")
-                    break
-        except (ValueError, TypeError):
-            pass
-
-    return total_weeks, current_week, phase_name, phase_milestone
+def _get_owned_plan(session: Session, plan_id: int, user_id: int) -> StudyPlan:
+    plan = session.exec(
+        select(StudyPlan).where(
+            StudyPlan.id == plan_id,
+            StudyPlan.user_id == user_id,
+        )
+    ).first()
+    if not plan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Study plan not found.",
+        )
+    return plan
 
 
-def _build_plan_response(
-    db_plan: StudyPlan,
-    db_sessions: list,
-    local_today: date,
-    db_subjects: Optional[list] = None,
-) -> PlanResponse:
-    """Shared PlanResponse builder."""
-    total_weeks, current_week, phase_name, phase_milestone = (
-        _compute_arc_metadata(db_plan, local_today)
+def _response(session: Session, plan: StudyPlan, today: date, user_id: int) -> PlanResponse:
+    subjects = session.exec(
+        select(PlanSubject).where(PlanSubject.plan_id == plan.id)
+    ).all()
+    return svc.build_plan_response(
+        session, plan, today, user_id=user_id, db_subjects=subjects
     )
 
-    if db_plan.deadline:
-        days_remaining = max((db_plan.deadline - local_today).days, 0)
-    else:
-        days_remaining = -1
 
-    today_str = local_today.isoformat()
-    upcoming = [s for s in db_sessions if s.date >= today_str]
-    upcoming_sorted = sorted(
-        upcoming,
-        key=lambda s: (s.date, s.time or "00:00"),
-    )
-
-    total_duration = sum(s.duration_mins for s in upcoming)
-    distinct_days = len({s.date for s in upcoming}) or 1
-    distinct_topics = len({s.subject for s in upcoming})
-
-    daily_target = (
-        total_duration // distinct_days
-        if upcoming
-        else DEFAULT_MINUTES_PER_DAY
-    )
-
-    stats = PlanStats(
-        days_remaining=days_remaining,
-        daily_target_mins=daily_target,
-        topics_count=distinct_topics,
-    )
-
-    # ----------------------------------------------------------
-    # Week strip — richer session_type
-    # ----------------------------------------------------------
-    week = []
-    for i in range(7):
-        current_date = local_today + timedelta(days=i)
-        date_str = current_date.isoformat()
-
-        day_sessions = [s for s in upcoming_sorted if s.date == date_str]
-
-        if not day_sessions:
-            session_type = "rest"
-        elif any(
-            normalize_priority(s.priority) == "weak_area"
-            for s in day_sessions
-        ):
-            session_type = "weak_area"
-        elif any(normalize_mode(s.mode) == "review" for s in day_sessions):
-            session_type = "review"
-        else:
-            session_type = "study"
-
-        week.append(
-            WeekDay(
-                date=date_str,
-                day_label=current_date.strftime("%a").upper(),
-                has_session=bool(day_sessions),
-                session_type=session_type,
-            )
+def _validate_deadline(deadline: Optional[date], today: date) -> None:
+    if deadline is None:
+        return
+    if deadline < today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That date has already passed.",
+        )
+    if (deadline - today).days > ps.MAX_HORIZON_DAYS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pick a date within 5 years.",
         )
 
-    formatted_sessions = [
-        SessionDetail(
-            id=str(s.id),
-            date=s.date,
-            time=s.time or "16:00",
-            subject=s.subject,
-            topic=getattr(s, "topic", None),
-            subject_id=getattr(s, "subject_id", None),
-            duration_mins=s.duration_mins,
-            mode=normalize_mode(s.mode),
-            priority=normalize_priority(s.priority),
-            completed=s.completed,
-            skipped=getattr(s, "skipped", False),
+
+def _times_or_400(raw: Optional[List[str]]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    times = ps.parse_times(raw)
+    if not times:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Study times must look like 08:15.",
         )
-        for s in upcoming_sorted
-    ]
+    return times
 
-    subjects_resp = []
-    for ps in (db_subjects or []):
-        ps_sessions = [s for s in db_sessions if s.subject_id == ps.id]
-        try:
-            topics_list = json.loads(ps.topics or "[]")
-        except (ValueError, TypeError):
-            topics_list = []
-        try:
-            weak_list = json.loads(ps.weak_topics or "[]")
-        except (ValueError, TypeError):
-            weak_list = []
 
-        subjects_resp.append(
-            PlanSubjectResponse(
-                id=ps.id,
-                name=ps.name,
-                exam_date=ps.exam_date,
-                weight=ps.weight,
-                current_level=ps.current_level,
-                topics=topics_list,
-                weak_topics=weak_list,
-                session_count=len(ps_sessions),
-                completed_count=sum(1 for s in ps_sessions if s.completed),
-            )
+def _days_or_400(raw: Optional[List[int]]) -> Optional[List[int]]:
+    if raw is None:
+        return None
+    days = ps.parse_days(raw)
+    if not days:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pick at least one study day.",
         )
+    return days
 
-    return PlanResponse(
-        plan_id=db_plan.id,
-        title=db_plan.title or db_plan.subject,
-        goal_type=db_plan.goal_type or "self_improvement",
-        emoji=db_plan.emoji,
-        color_hex=db_plan.color_hex,
-        is_approved=db_plan.is_approved,
-        goal=PlanGoal(
-            subject=db_plan.subject,
-            deadline=db_plan.deadline,
-        ),
-        stats=stats,
-        week=week,
-        sessions=formatted_sessions,
-        nudge=None,
-        subjects=subjects_resp,
-        plan_type=db_plan.plan_type or "single_goal",
-        notes=db_plan.notes,
-        total_weeks=total_weeks,
-        current_week=current_week,
-        phase_name=phase_name,
-        phase_milestone=phase_milestone,
-        updated_at=getattr(db_plan, "updated_at", None),
+
+def _reschedule(session: Session, plan: StudyPlan, today: date) -> None:
+    """Replace upcoming scheduler sessions using the current settings."""
+    svc.clear_future_plan_sessions(session, plan, today)
+    svc.fill_sessions(
+        session,
+        plan,
+        today=today,
+        from_date=today,
+        through=today + timedelta(days=svc.FILL_AHEAD_DAYS - 1),
     )
 
 
@@ -263,27 +158,19 @@ def list_study_plans(
     today = get_local_now(x_timezone).date()
 
     query = select(StudyPlan).where(StudyPlan.user_id == current_user.id)
-
     if not include_archived:
         query = query.where(StudyPlan.is_archived == False)  # noqa: E712
 
-    plans = session.exec(
-        query.order_by(StudyPlan.created_at.desc())
-    ).all()
+    plans = session.exec(query.order_by(StudyPlan.created_at.desc())).all()
 
     items: list[PlanListItem] = []
-
     for plan in plans:
         sessions = session.exec(
             select(StudySession).where(StudySession.plan_id == plan.id)
         ).all()
-
-        completed_count = sum(1 for s in sessions if s.completed)
-
-        days_remaining = None
-        if plan.deadline:
-            days_remaining = max((plan.deadline - today).days, 0)
-
+        days_remaining = (
+            max((plan.deadline - today).days, 0) if plan.deadline else None
+        )
         items.append(
             PlanListItem(
                 plan_id=plan.id,
@@ -297,11 +184,80 @@ def list_study_plans(
                 is_archived=plan.is_archived,
                 days_remaining=days_remaining,
                 session_count=len(sessions),
-                completed_count=completed_count,
+                completed_count=sum(1 for s in sessions if s.completed),
             )
         )
 
     return PlanListResponse(plans=items, total_count=len(items))
+
+
+# ============================================================
+# UPCOMING SESSIONS (for phone notifications)
+# ============================================================
+#
+# Declared before /users/me/plan/{plan_id} routes on purpose. The
+# app calls this on open and after any plan change, then schedules a
+# local notification for every session it returns.
+
+@router.get(
+    "/users/me/plan/upcoming",
+    response_model=UpcomingResponse,
+    status_code=status.HTTP_200_OK,
+)
+def upcoming_sessions(
+    days: int = 14,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+):
+    days = max(1, min(days, 21))
+    today = get_local_now(x_timezone).date()
+    svc.ensure_user_plans_filled(session, current_user.id, today)
+
+    plans = {
+        p.id: p
+        for p in session.exec(
+            select(StudyPlan).where(
+                StudyPlan.user_id == current_user.id,
+                StudyPlan.is_archived == False,  # noqa: E712
+            )
+        ).all()
+    }
+    if not plans:
+        return UpcomingResponse(sessions=[])
+
+    rows = session.exec(
+        select(StudySession)
+        .where(
+            StudySession.user_id == current_user.id,
+            StudySession.date >= today.isoformat(),
+            StudySession.date <= (today + timedelta(days=days - 1)).isoformat(),
+            StudySession.completed == False,  # noqa: E712
+            StudySession.skipped == False,  # noqa: E712
+        )
+        .order_by(StudySession.date, StudySession.time)
+    ).all()
+
+    out = []
+    for s in rows:
+        plan = plans.get(s.plan_id)
+        if plan is None:
+            continue
+        out.append(
+            UpcomingSession(
+                id=str(s.id),
+                plan_id=plan.id,
+                plan_title=plan.title or plan.subject,
+                emoji=plan.emoji,
+                date=s.date,
+                time=s.time or "18:00",
+                duration_mins=s.duration_mins,
+                topic=s.topic,
+                task=s.task,
+                mode=normalize_mode(s.mode),
+            )
+        )
+    return UpcomingResponse(sessions=out[:200])
 
 
 # ============================================================
@@ -318,6 +274,7 @@ def get_latest_study_plan(
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
+    today = get_local_now(x_timezone).date()
     db_plan = session.exec(
         select(StudyPlan)
         .where(
@@ -330,20 +287,11 @@ def get_latest_study_plan(
     if not db_plan:
         return None
 
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
+    if svc.ensure_filled(session, db_plan, today):
+        session.commit()
+        session.refresh(db_plan)
 
-    db_subjects = session.exec(
-        select(PlanSubject).where(PlanSubject.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        get_local_now(x_timezone).date(),
-        db_subjects=db_subjects,
-    )
+    return _response(session, db_plan, today, current_user.id)
 
 
 # ============================================================
@@ -361,38 +309,24 @@ def get_study_plan_by_id(
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
+    today = get_local_now(x_timezone).date()
+    db_plan = _get_owned_plan(session, plan_id, current_user.id)
 
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Study plan not found.",
-        )
+    if svc.ensure_filled(session, db_plan, today):
+        session.commit()
+        session.refresh(db_plan)
 
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
-
-    db_subjects = session.exec(
-        select(PlanSubject).where(PlanSubject.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        get_local_now(x_timezone).date(),
-        db_subjects=db_subjects,
-    )
+    return _response(session, db_plan, today, current_user.id)
 
 
 # ============================================================
 # GENERATE STUDY PLAN
 # ============================================================
+#
+# One AI call (or zero, when a cached roadmap matches) builds the
+# whole curriculum. Sessions for the next 14 days are created by
+# plan_scheduler at the user's own times. Plans are active straight
+# away — no separate approve step needed.
 
 @router.post(
     "/users/me/plan/generate",
@@ -403,388 +337,322 @@ def get_study_plan_by_id(
 async def generate_study_plan(
     request: Request,
     payload: PlanGenerateRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
     today = get_local_now(x_timezone).date()
 
-    # ── 1. Normalise input ─────────────────────────────────
-    subjects_input = payload.subjects or []
-    if not subjects_input:
-        if not payload.goal:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Provide either `goal` or `subjects[]`.",
-            )
-        subjects_input = [PlanSubjectInput(name=payload.goal)]
+    # ── 1. What is the goal? ────────────────────────────────
+    goal = (payload.goal or "").strip()
+    notes = (payload.notes or "").strip() or None
+    deadline = payload.deadline
 
-    if len(subjects_input) > 30:
+    if payload.subjects:
+        # Legacy multi-subject sheet: one plan covering all of them.
+        names = [s.name.strip() for s in payload.subjects if s.name.strip()][:10]
+        if not goal or len(names) > 1:
+            goal = ", ".join(names)
+        topic_bits = []
+        for s in payload.subjects:
+            if s.topics:
+                topic_bits.append(f"{s.name}: {', '.join(s.topics[:8])}")
+            if s.weak_topics:
+                topic_bits.append(f"{s.name} weak: {', '.join(s.weak_topics[:6])}")
+        if topic_bits:
+            notes = ((notes + ". ") if notes else "") + "; ".join(topic_bits)
+        if deadline is None:
+            exam_dates = [s.exam_date for s in payload.subjects if s.exam_date]
+            deadline = max(exam_dates) if exam_dates else None
+
+    goal = goal[:200]
+    if not goal:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 30 subjects per plan.",
+            detail="Tell us what you want to learn or prepare for.",
         )
+    _validate_deadline(deadline, today)
 
-    for s in subjects_input:
-        if s.exam_date and s.exam_date < today:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Exam date for '{s.name}' is in the past.",
-            )
-
-    # Plan deadline = latest exam date, or explicit payload.deadline
-    latest_exam = max(
-        (s.exam_date for s in subjects_input if s.exam_date),
-        default=None,
-    )
-    deadline = payload.deadline or latest_exam
-    if deadline and (deadline - today).days < 0:
+    active = session.exec(
+        select(StudyPlan.id).where(
+            StudyPlan.user_id == current_user.id,
+            StudyPlan.is_archived == False,  # noqa: E712
+        )
+    ).all()
+    if len(active) >= MAX_ACTIVE_PLANS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Deadline passed.",
+            detail=f"You can have {MAX_ACTIVE_PLANS} active plans. Archive one first.",
         )
-    days_remaining = (deadline - today).days if deadline else None
 
-    # ── 2. Persona + availability ──────────────────────────
+    # ── 2. Schedule settings ───────────────────────────────
     goal_type = resolve_goal_type(payload.goal_type, current_user.goal_type)
     defaults = persona_defaults(goal_type)
     avail = payload.availability
-    minutes_per_day = (
-        avail.minutes_per_day
-        if avail and avail.minutes_per_day
-        else (current_user.daily_goal_mins or DEFAULT_MINUTES_PER_DAY)
-    )
-    study_days = (
-        avail.study_days_per_week
-        if avail and avail.study_days_per_week
-        else DEFAULT_STUDY_DAYS_PER_WEEK
-    )
-    session_pref = (
-        avail.session_length_pref
-        if avail and avail.session_length_pref
-        else 45
-    )
-    earliest = (avail.earliest if avail and avail.earliest else "07:00")
-    latest = (avail.latest if avail and avail.latest else "22:00")
 
-    window_days = DEFAULT_WINDOW_DAYS
-    if days_remaining is not None and days_remaining < DEFAULT_WINDOW_DAYS:
-        window_days = max(days_remaining, 1)
+    level = payload.level or "beginner"
+    if not payload.level and payload.subjects:
+        level = payload.subjects[0].current_level or "beginner"
 
-    # ── 3. Phase skeleton (only if multi-week) ────────────
-    total_wk = (
-        max(1, ceil(days_remaining / 7)) if days_remaining is not None else -1
+    minutes = (
+        payload.minutes_per_day
+        or (avail.minutes_per_day if avail else None)
+        or current_user.daily_goal_mins
+        or DEFAULT_MINUTES_PER_DAY
     )
-    phase_data = None
-    if total_wk >= 2:
-        label = (
-            subjects_input[0].name
-            if len(subjects_input) == 1
-            else (payload.title or payload.goal or "multi-subject plan")
-        )
-        phase_data = await generate_gemini_phase_plan(
-            goal=label,
-            goal_type=goal_type,
-            total_weeks=total_wk,
-            minutes_per_day=minutes_per_day,
-            study_days_per_week=study_days,
-        )
-    first_phase = (
-        phase_data["phases"][0]
-        if phase_data and phase_data.get("phases")
-        else None
+    minutes = max(10, min(int(minutes), 600))
+
+    days = _days_or_400(payload.days_of_week)
+    if days is None:
+        per_week = avail.study_days_per_week if avail and avail.study_days_per_week else 6
+        days = list(range(1, per_week + 1))
+
+    times = _times_or_400(payload.preferred_times)
+    if times is None:
+        first = avail.earliest if avail and avail.earliest else None
+        times = ps.parse_times([first]) or [ps.DEFAULT_TIMES.get(goal_type, "18:00")]
+
+    kind_hint = ps.guess_goal_kind(goal)
+    total_weeks = ps.horizon_weeks(today, deadline, kind_hint, level)
+
+    # ── 3. Roadmap: cache → AI → fallback ──────────────────
+    roadmap, source = await svc.obtain_roadmap(
+        session,
+        current_user,
+        goal=goal,
+        level=level,
+        total_weeks=total_weeks,
+        has_deadline=deadline is not None,
+        minutes_per_day=minutes,
+        days_per_week=len(days),
+        times_count=len(times),
+        goal_type=goal_type,
+        today=today,
+        notes=notes,
     )
 
-    # ── 4. Persist plan + subjects ─────────────────────────
+    # ── 4. Save the plan + first 14 days ───────────────────
     try:
-        title = payload.title or (
-            subjects_input[0].name
-            if len(subjects_input) == 1
-            else f"{len(subjects_input)}-subject plan"
-        )
-
+        title = (payload.title or roadmap.get("title") or goal)[:80]
         db_plan = StudyPlan(
             user_id=current_user.id,
-            title=title[:80],
-            subject=subjects_input[0].name,
+            title=title,
+            subject=goal,
             goal_type=goal_type,
             deadline=deadline,
-            emoji=payload.emoji or defaults["emoji"],
+            emoji=payload.emoji or roadmap.get("emoji") or defaults["emoji"],
             color_hex=payload.color_hex or defaults["color_hex"],
-            is_approved=False,
+            is_approved=True,
             start_date=today,
             window_start=today,
-            window_days=window_days,
-            phase_plan=json.dumps(phase_data) if phase_data else None,
-            plan_type=payload.plan_type,
-            notes=payload.notes,
+            window_days=svc.FILL_AHEAD_DAYS,
+            plan_type=payload.plan_type or roadmap["goal_kind"],
+            notes=notes,
+            goal_kind=roadmap["goal_kind"],
+            level=level,
+            minutes_per_day=minutes,
+            days_of_week=json.dumps(days),
+            preferred_times=json.dumps(times),
+            roadmap=json.dumps(roadmap),
+            roadmap_source=source,
+            roadmap_start=today,
         )
         session.add(db_plan)
         session.commit()
         session.refresh(db_plan)
 
-        db_subjects: list[PlanSubject] = []
-        for s in subjects_input:
-            ps = PlanSubject(
-                plan_id=db_plan.id,
-                name=s.name[:100],
-                exam_date=s.exam_date,
-                weight=s.weight,
-                current_level=s.current_level,
-                topics=json.dumps(s.topics or []),
-                weak_topics=json.dumps(s.weak_topics or []),
-            )
-            session.add(ps)
-            db_subjects.append(ps)
-        session.commit()
-        for ps in db_subjects:
-            session.refresh(ps)
+        svc.fill_sessions(
+            session,
+            db_plan,
+            today=today,
+            from_date=today,
+            through=today + timedelta(days=svc.FILL_AHEAD_DAYS - 1),
+        )
 
-    except Exception:
+        # Keep the profile in sync so the dashboard countdown and the
+        # goal card reflect the newest plan.
+        if not current_user.study_goal:
+            current_user.study_goal = goal[:200]
+        if deadline and not current_user.target_date:
+            current_user.target_date = deadline
+        session.add(current_user)
+        session.commit()
+        session.refresh(db_plan)
+    except HTTPException:
+        raise
+    except Exception as e:
         session.rollback()
+        print(f"Plan save failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not save your study plan. Please try again.",
         )
 
-    # ── 5. Generate sessions (retry → fallback) ───────────
-    subjects_dicts = [
-        {
-            "name": ps.name,
-            "exam_date": ps.exam_date,
-            "weight": ps.weight,
-            "current_level": ps.current_level,
-            "topics": json.loads(ps.topics or "[]"),
-            "weak_topics": json.loads(ps.weak_topics or "[]"),
-        }
-        for ps in db_subjects
-    ]
-    subject_id_by_name = {ps.name: ps.id for ps in db_subjects}
+    # Multi-year plans: detail the first long phase right away (one
+    # AI call, after the response is sent) instead of waiting for the
+    # hourly loop.
+    if source == "ai" and total_weeks > 26:
+        background_tasks.add_task(refine_if_needed, db_plan.id, today)
 
-    window_data = None
-    for _attempt in (1, 2):
-        window_data = await generate_gemini_multisubject_plan(
-            subjects=subjects_dicts,
-            plan_title=title,
-            plan_type=payload.plan_type,
-            goal_type=goal_type,
-            window_start=today,
-            window_days=window_days,
-            minutes_per_day=minutes_per_day,
-            study_days_per_week=study_days,
-            earliest=earliest,
-            latest=latest,
-            session_length_pref=session_pref,
-            phase_context=first_phase,
-            notes=payload.notes,
-        )
-        if window_data and window_data.get("sessions"):
-            break
+    return _response(session, db_plan, today, current_user.id)
 
-    if not window_data or not window_data.get("sessions"):
-        window_data = build_fallback_schedule(
-            subjects=subjects_dicts,
-            window_start=today,
-            window_days=window_days,
-            minutes_per_day=minutes_per_day,
-            study_days_per_week=study_days,
-            session_length_pref=session_pref,
-        )
 
-    try:
-        for s in window_data["sessions"]:
-            session.add(
-                StudySession(
-                    plan_id=db_plan.id,
-                    user_id=current_user.id,
-                    date=s["date"],
-                    time=s["time"],
-                    subject=s["subject_name"],
-                    subject_id=subject_id_by_name.get(s["subject_name"]),
-                    topic=s.get("topic"),
-                    duration_mins=s["duration_mins"],
-                    mode=s["mode"],
-                    priority=s["priority"],
-                    completed=False,
-                )
-            )
-        session.commit()
-    except Exception:
-        session.rollback()
+# ============================================================
+# CHANGE SCHEDULE (free — no AI)
+# ============================================================
+
+@router.patch(
+    "/users/me/plan/{plan_id}/schedule",
+    response_model=PlanResponse,
+    status_code=status.HTTP_200_OK,
+)
+def update_plan_schedule(
+    plan_id: int,
+    payload: PlanScheduleUpdate,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+):
+    today = get_local_now(x_timezone).date()
+    plan = _get_owned_plan(session, plan_id, current_user.id)
+    if plan.is_archived:
+        raise HTTPException(status_code=400, detail="Restore this plan first.")
+
+    svc.upgrade_legacy_plan(session, plan, today)
+
+    days = _days_or_400(payload.days_of_week)
+    times = _times_or_400(payload.preferred_times)
+    if payload.minutes_per_day is not None:
+        plan.minutes_per_day = payload.minutes_per_day
+    if days is not None:
+        plan.days_of_week = json.dumps(days)
+    if times is not None:
+        plan.preferred_times = json.dumps(times)
+    if payload.clear_deadline:
+        plan.deadline = None
+    elif payload.deadline is not None:
+        _validate_deadline(payload.deadline, today)
+        plan.deadline = payload.deadline
+
+    _reschedule(session, plan, today)
+    session.commit()
+    session.refresh(plan)
+    return _response(session, plan, today, current_user.id)
+
+
+# ============================================================
+# RE-PLAN WITH AI (uses one AI credit)
+# ============================================================
+
+@router.post(
+    "/users/me/plan/{plan_id}/replan",
+    response_model=PlanResponse,
+    status_code=status.HTTP_200_OK,
+)
+@limiter.limit("3/minute")
+async def replan_study_plan(
+    request: Request,
+    plan_id: int,
+    payload: PlanReplanRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
+):
+    today = get_local_now(x_timezone).date()
+    plan = _get_owned_plan(session, plan_id, current_user.id)
+    if plan.is_archived:
+        raise HTTPException(status_code=400, detail="Restore this plan first.")
+
+    if svc.ai_plans_left(session, current_user.id, today) <= 0:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not save sessions. Please try again.",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="You've used today's AI plan builds. You can still change times "
+                   "and days for free, or re-plan tomorrow.",
+        )
+    if plan.deadline and plan.deadline < today:
+        raise HTTPException(status_code=400, detail="This plan's date has passed. Set a new date first.")
+
+    svc.upgrade_legacy_plan(session, plan, today)
+    if payload.level:
+        plan.level = payload.level
+
+    summary = svc.progress_summary(session, plan, today)
+    days = svc.plan_days(plan)
+    kind = plan.goal_kind or ps.guess_goal_kind(plan.subject)
+    remaining_weeks = ps.horizon_weeks(today, plan.deadline, kind, plan.level or "beginner")
+    if plan.deadline is None:
+        old = svc.load_roadmap(plan)
+        if old:
+            end = ps.roadmap_end(svc.plan_start(plan), None, old)
+            remaining_weeks = max(2, -(-((end - today).days + 1) // 7))
+
+    roadmap, source = await svc.obtain_roadmap(
+        session,
+        current_user,
+        goal=plan.subject,
+        level=plan.level or "beginner",
+        total_weeks=remaining_weeks,
+        has_deadline=plan.deadline is not None,
+        minutes_per_day=plan.minutes_per_day or DEFAULT_MINUTES_PER_DAY,
+        days_per_week=len(days),
+        times_count=len(svc.plan_times(plan)),
+        goal_type=plan.goal_type,
+        today=today,
+        notes=plan.notes,
+        progress_summary=summary,
+        feedback=(payload.feedback or "").strip() or None,
+    )
+    if source != "ai":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The AI is busy right now — your plan is unchanged. Try again in a minute.",
         )
 
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == db_plan.id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        today,
-        db_subjects=db_subjects,
-    )
+    plan.roadmap = json.dumps(roadmap)
+    plan.roadmap_source = source
+    plan.roadmap_start = today
+    plan.goal_kind = roadmap["goal_kind"]
+    plan.arc_version = (plan.arc_version or 1) + 1
+    _reschedule(session, plan, today)
+    session.commit()
+    session.refresh(plan)
+    if remaining_weeks > 26:
+        background_tasks.add_task(refine_if_needed, plan.id, today)
+    return _response(session, plan, today, current_user.id)
 
 
 # ============================================================
-# EXTEND PLAN WINDOW
+# EXTEND (top up the next 14 days — no AI)
 # ============================================================
-#
-# Tops up the rolling window by `window_days` from the day after
-# the current last session. This is what fixes the "plan looks
-# empty after a week" complaint — the client calls this when the
-# user taps "Generate next 14 days".
 
 @router.post(
     "/users/me/plan/{plan_id}/extend",
     response_model=PlanResponse,
     status_code=status.HTTP_200_OK,
 )
-async def extend_study_plan(
+def extend_study_plan(
     plan_id: int,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
     today = get_local_now(x_timezone).date()
+    plan = _get_owned_plan(session, plan_id, current_user.id)
+    if plan.is_archived:
+        raise HTTPException(status_code=400, detail="Cannot extend an archived plan.")
+    if plan.deadline and plan.deadline < today:
+        raise HTTPException(status_code=400, detail="Plan deadline has passed.")
 
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-    if db_plan.is_archived:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot extend an archived plan.",
-        )
-
-    db_subjects = session.exec(
-        select(PlanSubject).where(PlanSubject.plan_id == plan_id)
-    ).all()
-    if not db_subjects:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Plan has no subjects to extend.",
-        )
-
-    # Window starts the day after the latest existing session
-    last = session.exec(
-        select(StudySession)
-        .where(StudySession.plan_id == plan_id)
-        .order_by(StudySession.date.desc())
-    ).first()
-
-    window_start = today
-    if last:
-        try:
-            tail = date.fromisoformat(last.date)
-            window_start = max(today, tail + timedelta(days=1))
-        except (ValueError, TypeError):
-            pass
-
-    window_days = db_plan.window_days or DEFAULT_WINDOW_DAYS
-    if db_plan.deadline:
-        remaining = (db_plan.deadline - window_start).days
-        if remaining <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Plan deadline has passed.",
-            )
-        window_days = min(window_days, remaining)
-
-    minutes_per_day = current_user.daily_goal_mins or DEFAULT_MINUTES_PER_DAY
-    study_days = DEFAULT_STUDY_DAYS_PER_WEEK
-
-    subjects_dicts = [
-        {
-            "name": ps.name,
-            "exam_date": ps.exam_date,
-            "weight": ps.weight,
-            "current_level": ps.current_level,
-            "topics": json.loads(ps.topics or "[]"),
-            "weak_topics": json.loads(ps.weak_topics or "[]"),
-        }
-        for ps in db_subjects
-    ]
-    subject_id_by_name = {ps.name: ps.id for ps in db_subjects}
-
-    recent = session.exec(
-        select(StudySession)
-        .where(StudySession.plan_id == plan_id)
-        .order_by(StudySession.date.desc())
-        .limit(20)
-    ).all()
-    recent_topics = [
-        s.topic or s.subject for s in recent if (s.topic or s.subject)
-    ]
-
-    window_data = await generate_gemini_multisubject_plan(
-        subjects=subjects_dicts,
-        plan_title=db_plan.title or db_plan.subject,
-        plan_type=db_plan.plan_type or "single_goal",
-        goal_type=db_plan.goal_type,
-        window_start=window_start,
-        window_days=window_days,
-        minutes_per_day=minutes_per_day,
-        study_days_per_week=study_days,
-        notes=db_plan.notes,
-        recent_topics=recent_topics,
+    start = max(today, (plan.scheduled_through or today - timedelta(days=1)) + timedelta(days=1))
+    svc.fill_sessions(
+        session, plan, today=today, from_date=start,
+        through=start + timedelta(days=svc.FILL_AHEAD_DAYS - 1),
     )
-    if not window_data or not window_data.get("sessions"):
-        window_data = build_fallback_schedule(
-            subjects=subjects_dicts,
-            window_start=window_start,
-            window_days=window_days,
-            minutes_per_day=minutes_per_day,
-            study_days_per_week=study_days,
-        )
-
-    try:
-        for s in window_data["sessions"]:
-            session.add(
-                StudySession(
-                    plan_id=plan_id,
-                    user_id=current_user.id,
-                    date=s["date"],
-                    time=s["time"],
-                    subject=s["subject_name"],
-                    subject_id=subject_id_by_name.get(s["subject_name"]),
-                    topic=s.get("topic"),
-                    duration_mins=s["duration_mins"],
-                    mode=s["mode"],
-                    priority=s["priority"],
-                    completed=False,
-                )
-            )
-        db_plan.window_start = window_start
-        session.add(db_plan)
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not extend plan. Please try again.",
-        )
-
-    db_sessions = session.exec(
-        select(StudySession).where(StudySession.plan_id == plan_id)
-    ).all()
-
-    return _build_plan_response(
-        db_plan,
-        db_sessions,
-        today,
-        db_subjects=db_subjects,
-    )
+    session.commit()
+    session.refresh(plan)
+    return _response(session, plan, today, current_user.id)
 
 
 # ============================================================
@@ -800,30 +668,24 @@ def update_plan_metadata(
     payload: PlanUpdateRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
 ):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
+    today = get_local_now(x_timezone).date()
+    db_plan = _get_owned_plan(session, plan_id, current_user.id)
 
     if payload.title is not None:
-        db_plan.title = payload.title
-    if payload.deadline is not None:
-        db_plan.deadline = payload.deadline
+        db_plan.title = payload.title.strip()[:80] or db_plan.title
     if payload.emoji is not None:
         db_plan.emoji = payload.emoji
     if payload.color_hex is not None:
         db_plan.color_hex = payload.color_hex
     if payload.goal_type is not None:
         db_plan.goal_type = resolve_goal_type(payload.goal_type, None)
+    if payload.deadline is not None and payload.deadline != db_plan.deadline:
+        _validate_deadline(payload.deadline, today)
+        db_plan.deadline = payload.deadline
+        svc.upgrade_legacy_plan(session, db_plan, today)
+        _reschedule(session, db_plan, today)
 
     session.add(db_plan)
     session.commit()
@@ -849,35 +711,28 @@ def archive_plan(
     payload: PlanArchiveRequest,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
+    x_timezone: str = Header("UTC"),
 ):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
+    today = get_local_now(x_timezone).date()
+    db_plan = _get_owned_plan(session, plan_id, current_user.id)
 
     db_plan.is_archived = payload.archived
+    if payload.archived:
+        # Archived plans stop producing sessions and reminders.
+        svc.clear_future_plan_sessions(session, db_plan, today)
     session.add(db_plan)
     session.commit()
 
     return {
-        "message": (
-            "Plan archived." if payload.archived else "Plan restored."
-        ),
+        "message": "Plan archived." if payload.archived else "Plan restored.",
         "plan_id": db_plan.id,
         "is_archived": db_plan.is_archived,
     }
 
 
 # ============================================================
-# APPROVE — legacy route
+# APPROVE — kept for older app versions (plans are now active
+# as soon as they are created)
 # ============================================================
 
 @router.patch(
@@ -899,26 +754,17 @@ def approve_latest_plan_legacy(
     ).first()
 
     if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No plan to approve.",
-        )
+        raise HTTPException(status_code=404, detail="No plan to approve.")
 
     db_plan.is_approved = request.approved
     session.add(db_plan)
     session.commit()
-    session.refresh(db_plan)
-
     return {
         "message": f"Plan {db_plan.id} approved status updated",
         "approved": db_plan.is_approved,
         "plan_id": db_plan.id,
     }
 
-
-# ============================================================
-# APPROVE — canonical per-plan
-# ============================================================
 
 @router.patch(
     "/users/me/plan/{plan_id}/approve",
@@ -930,24 +776,10 @@ def approve_study_plan(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
-
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Plan not found.",
-        )
-
+    db_plan = _get_owned_plan(session, plan_id, current_user.id)
     db_plan.is_approved = request.approved
     session.add(db_plan)
     session.commit()
-    session.refresh(db_plan)
-
     return {
         "message": f"Plan {plan_id} approved status updated",
         "approved": db_plan.is_approved,
@@ -968,20 +800,15 @@ def add_manual_session(
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
-    db_plan = session.exec(
-        select(StudyPlan).where(
-            StudyPlan.id == plan_id,
-            StudyPlan.user_id == current_user.id,
-        )
-    ).first()
+    db_plan = _get_owned_plan(session, plan_id, current_user.id)
 
-    if not db_plan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Study plan not found.",
-        )
+    if not ps.parse_times([payload.time]):
+        raise HTTPException(status_code=400, detail="Time must look like 08:15.")
+    try:
+        date.fromisoformat(payload.date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date must look like 2026-01-31.")
 
-    # Auto-link to a PlanSubject row if the name matches.
     subject_row = session.exec(
         select(PlanSubject).where(
             PlanSubject.plan_id == db_plan.id,
@@ -993,13 +820,16 @@ def add_manual_session(
         plan_id=db_plan.id,
         user_id=current_user.id,
         date=payload.date,
-        time=payload.time,
-        subject=payload.subject,
+        time=ps.parse_times([payload.time])[0],
+        subject=db_plan.title or db_plan.subject,
+        topic=payload.subject,
+        task=payload.subject,
         subject_id=subject_row.id if subject_row else None,
         duration_mins=payload.duration_mins,
         mode=normalize_mode(payload.mode),
         priority=normalize_priority(payload.priority),
         completed=False,
+        source="manual",
     )
 
     session.add(new_session)
@@ -1011,7 +841,9 @@ def add_manual_session(
         "session": {
             "id": str(new_session.id),
             "date": new_session.date,
+            "time": new_session.time,
             "subject": new_session.subject,
+            "topic": new_session.topic,
             "subject_id": new_session.subject_id,
             "duration_mins": new_session.duration_mins,
             "mode": new_session.mode,
@@ -1041,23 +873,20 @@ def update_session(
     ).first()
 
     if not db_session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found.",
-        )
+        raise HTTPException(status_code=404, detail="Session not found.")
 
     if request.scheduled_time is not None:
-        db_session.time = request.scheduled_time
+        cleaned = ps.parse_times([request.scheduled_time])
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="Time must look like 08:15.")
+        db_session.time = cleaned[0]
 
     if request.duration_mins is not None:
-        if request.duration_mins <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Duration must be greater than zero.",
-            )
         db_session.duration_mins = request.duration_mins
 
     if request.skipped is not None:
+        if db_session.completed and request.skipped:
+            raise HTTPException(status_code=400, detail="This session is already done.")
         db_session.skipped = request.skipped
 
     session.add(db_session)
@@ -1071,6 +900,7 @@ def update_session(
         "time": db_session.time,
         "subject": db_session.subject,
         "topic": db_session.topic,
+        "task": db_session.task,
         "subject_id": db_session.subject_id,
         "duration_mins": db_session.duration_mins,
         "mode": normalize_mode(db_session.mode),
@@ -1101,12 +931,15 @@ def delete_session(
     ).first()
 
     if not db_session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found.",
-        )
+        raise HTTPException(status_code=404, detail="Session not found.")
 
-    session.delete(db_session)
+    if db_session.source == "plan" and not db_session.completed:
+        # Deleting a scheduler session would just be regenerated on the
+        # next top-up, so mark it skipped instead.
+        db_session.skipped = True
+        session.add(db_session)
+    else:
+        session.delete(db_session)
     session.commit()
 
     return {"message": "Session removed from plan."}
@@ -1126,6 +959,7 @@ def complete_session(
     session: Session = Depends(get_session),
     x_timezone: str = Header("UTC"),
 ):
+    local_now = get_local_now(x_timezone)
     db_session = session.exec(
         select(StudySession)
         .where(
@@ -1141,18 +975,29 @@ def complete_session(
             detail="Session invalid or already completed.",
         )
 
+    # Sessions can be done early on the same day, or caught up later,
+    # but not ticked off days in advance (XP farming).
+    try:
+        if date.fromisoformat(db_session.date) > local_now.date():
+            raise HTTPException(
+                status_code=400,
+                detail="You can complete this session on its day.",
+            )
+    except ValueError:
+        pass
+
     db_session.completed = True
+    db_session.skipped = False
     session.add(db_session)
 
-    # One minute studied = one base XP (capped so a giant manual
-    # session can't farm XP). award_xp adds the pet's trait bonus,
-    # levels the pet up, updates the streak and co-op quests.
+    # One minute studied = one base XP (capped). award_xp adds the
+    # pet's trait bonus, levels the pet up, updates streak and quests.
     minutes = min(db_session.duration_mins or 0, 180)
     reward = award_xp(
         session,
         current_user,
         minutes,
-        local_now=get_local_now(x_timezone),
+        local_now=local_now,
         source="plan_session",
         duration_mins=minutes,
         minutes_studied=minutes,

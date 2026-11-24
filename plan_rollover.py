@@ -1,247 +1,137 @@
+"""
+plan_rollover.py — keeps every active plan filled ~14 days ahead.
+
+v2 changes
+----------
+* Topping up is pure code (plan_scheduler) — no AI call per window.
+  The old version called Gemini for every plan every week.
+* The same top-up also runs lazily when the app opens the dashboard,
+  plan or upcoming list (plan_service.ensure_filled), so plans keep
+  going even when Render's free instance was asleep.
+* Multi-year plans: when a learner reaches a long phase that is still
+  coarse, ONE AI call breaks that phase into detailed units
+  (refine_plan_phase). At most once per phase.
+"""
+
 import asyncio
 import json
-from datetime import date, timedelta
-from typing import Optional
+from datetime import date
 
 from sqlmodel import Session, select
 
+import plan_scheduler as ps
+import plan_service as svc
+from ai_service import refine_plan_phase
 from database import engine
-from models import StudyPlan, StudySession
-from ai_service import generate_gemini_study_plan
+from models import StudyPlan
 
 
-ROLLOVER_LOOKAHEAD_DAYS = 3
-RECENT_TOPICS_LOOKBACK_DAYS = 14
 ROLLOVER_INTERVAL_SECONDS = 3600
+MAX_REFINES_PER_TICK = 5
 
 
-def _phase_for_week(
-    plan_phase_plan_raw: Optional[str],
-    week: int,
-) -> Optional[dict]:
-    """Return the phase dict that contains `week`, or None."""
-    if not plan_phase_plan_raw:
-        return None
-    try:
-        data = json.loads(plan_phase_plan_raw)
-    except (ValueError, TypeError):
-        return None
-    for p in data.get("phases", []):
-        if p.get("start_week", 0) <= week <= p.get("end_week", 0):
-            return p
-    return None
-
-
-async def extend_plan_window(plan_id: int) -> bool:
-    """
-    Generate the next window for a plan if it's due.
-
-    Idempotent — if sessions already exist for the target window,
-    returns False without calling the AI.
-
-    Opens the DB session briefly, drops it during the AI call, then
-    opens a new one to persist. This keeps the connection pool free
-    during the 10–20s the model is thinking.
-    """
-    # ------------------------------------------------------------
-    # STEP 1 — Read state
-    # ------------------------------------------------------------
+async def refine_if_needed(plan_id: int, today: date) -> bool:
+    """Detail the current phase of a long plan. Returns True if changed."""
     with Session(engine) as db:
         plan = db.get(StudyPlan, plan_id)
-        if not plan or plan.is_archived or not plan.is_approved:
+        if not plan or plan.is_archived:
             return False
-
-        if not plan.window_start:
-            plan.window_start = plan.start_date or date.today()
-            db.add(plan)
-            db.commit()
-
-        # ------------------------------------------------------------
-        # CATCH-UP: if the next window would start in the past,
-        # skip forward in whole-window steps until it lands on or
-        # after today. This handles the case where the app was
-        # asleep or down for days and the natural rollover fire
-        # time has passed.
-        # ------------------------------------------------------------
-        next_start = plan.window_start + timedelta(days=plan.window_days)
-        today_utc = date.today()
-
-        while next_start < today_utc:
-            next_start = next_start + timedelta(days=plan.window_days)
-
-        next_end = next_start + timedelta(days=plan.window_days - 1)
-
-        if plan.deadline and next_start > plan.deadline:
+        rm = svc.load_roadmap(plan)
+        if not rm:
             return False
-
-        existing = db.exec(
-            select(StudySession).where(
-                StudySession.plan_id == plan.id,
-                StudySession.date >= next_start.isoformat(),
-                StudySession.date <= next_end.isoformat(),
-            )
-        ).first()
-
-        if existing:
-            # Window already generated — advance the pointer and bail.
-            plan.window_start = next_start
-            db.add(plan)
-            db.commit()
+        days = svc.plan_days(plan)
+        start = svc.plan_start(plan)
+        idx = ps.phase_needing_detail(
+            roadmap=rm, start=start, deadline=plan.deadline, days=days, today=today,
+        )
+        if idx is None:
             return False
-
-        # Snapshot values we need after the session closes.
         snapshot = {
-            "subject": plan.subject,
-            "goal_type": plan.goal_type,
-            "deadline": plan.deadline,
-            "start_date": plan.start_date,
-            "window_days": plan.window_days,
-            "phase_plan_raw": plan.phase_plan,
+            "goal": plan.subject,
+            "kind": rm.get("goal_kind", "skill"),
+            "level": plan.level or "beginner",
+            "minutes": plan.minutes_per_day or 45,
+            "phase": rm["phases"][idx],
+            "done": [u["title"] for p in rm["phases"][:idx] for u in p["units"]],
+            "version": plan.arc_version,
         }
 
-        # Recent context — topics and skips from the last 14 days.
-        cutoff = (
-            date.today() - timedelta(days=RECENT_TOPICS_LOOKBACK_DAYS)
-        ).isoformat()
-
-        recent_rows = db.exec(
-            select(StudySession).where(
-                StudySession.plan_id == plan.id,
-                StudySession.date >= cutoff,
-            )
-        ).all()
-
-        recent_topics: list[str] = []
-        recent_skips: list[str] = []
-        seen: set[str] = set()
-        for s in recent_rows:
-            if s.subject and s.subject not in seen:
-                seen.add(s.subject)
-                recent_topics.append(s.subject)
-            if s.skipped and s.subject not in recent_skips:
-                recent_skips.append(s.subject)
-
-    # ------------------------------------------------------------
-    # STEP 2 — Compute phase context (no DB)
-    # ------------------------------------------------------------
-    phase = None
-    if snapshot["start_date"]:
-        week_for_next = (
-            (next_start - snapshot["start_date"]).days // 7
-        ) + 1
-        phase = _phase_for_week(snapshot["phase_plan_raw"], week_for_next)
-
-    days_remaining = None
-    if snapshot["deadline"]:
-        days_remaining = max((snapshot["deadline"] - next_start).days, 0)
-
- 
-    # ------------------------------------------------------------
-    # STEP 3 — AI call (no DB lock held)
-    # ------------------------------------------------------------
-    # Change the function name here:
-    window_data = await generate_gemini_study_plan(
-        goal=snapshot["subject"],
-        target_date=snapshot["deadline"],
-        days_remaining=days_remaining,
-        goal_type=snapshot["goal_type"],
-        window_start=next_start,
-        window_days=snapshot["window_days"],
-        phase_context=phase,
-        recent_topics=recent_topics,
-        recent_skips=recent_skips,
+    # AI call with no DB connection held.
+    units = await refine_plan_phase(
+        snapshot["goal"],
+        kind=snapshot["kind"],
+        level=snapshot["level"],
+        phase=snapshot["phase"],
+        phase_weeks=snapshot["phase"]["weeks"],
+        minutes_per_day=snapshot["minutes"],
+        done_units=snapshot["done"],
     )
 
-    if not window_data or not window_data.get("sessions"):
-        return False
-
-    # ------------------------------------------------------------
-    # STEP 4 — Persist (short session, with a race re-check)
-    # ------------------------------------------------------------
     with Session(engine) as db:
         plan = db.get(StudyPlan, plan_id)
-        if not plan:
+        if not plan or plan.arc_version != snapshot["version"]:
+            return False  # re-planned meanwhile
+        rm = svc.load_roadmap(plan)
+        if not rm or idx >= len(rm["phases"]):
             return False
-
-        # Re-check: a parallel run might have beaten us to it.
-        existing = db.exec(
-            select(StudySession).where(
-                StudySession.plan_id == plan.id,
-                StudySession.date >= next_start.isoformat(),
-                StudySession.date <= next_end.isoformat(),
+        phase = rm["phases"][idx]
+        if units:
+            candidate = dict(rm)
+            candidate["phases"] = list(rm["phases"])
+            candidate["phases"][idx] = {**phase, "units": units, "detailed": True}
+            fixed = ps.normalize_roadmap(
+                candidate,
+                total_weeks=rm.get("total_weeks") or sum(p["weeks"] for p in rm["phases"]),
+                goal=plan.subject,
+                kind_hint=rm.get("goal_kind", "skill"),
             )
-        ).first()
-
-        if existing:
-            plan.window_start = next_start
-            db.add(plan)
-            db.commit()
-            return False
-
-        for s in window_data["sessions"]:
-            db.add(
-                StudySession(
-                    plan_id=plan.id,
-                    user_id=plan.user_id,
-                    date=s["date"],
-                    time=s["time"],
-                    subject=s["subject"],
-                    duration_mins=s["duration_mins"],
-                    mode=s["mode"],
-                    priority=s["priority"],
-                    completed=False,
-                )
-            )
-
-        plan.window_start = next_start
+            if fixed:
+                fixed["phases"][idx]["detailed"] = True
+                rm = fixed
+        # Mark as detailed even on failure so we never retry in a loop.
+        rm["phases"][idx]["detailed"] = True
+        plan.roadmap = json.dumps(rm)
         db.add(plan)
-        db.commit()
 
-    return True
+        # Sessions not yet started should use the new detail.
+        if units:
+            svc.clear_future_plan_sessions(db, plan, today)
+            svc.ensure_filled(db, plan, today)
+        db.commit()
+    return bool(units)
 
 
 async def _rollover_tick() -> None:
-    """
-    One pass over all eligible plans. Extracted so the loop can
-    call it both immediately on startup and then on every sleep.
-    """
+    today = date.today()
+
     with Session(engine) as db:
-        candidates = db.exec(
-            select(StudyPlan).where(
-                StudyPlan.is_archived == False,  # noqa: E712
-                StudyPlan.is_approved == True,   # noqa: E712
-                StudyPlan.window_start != None,  # noqa: E711
-            )
+        plans = db.exec(
+            select(StudyPlan).where(StudyPlan.is_archived == False)  # noqa: E712
         ).all()
+        plan_ids = [p.id for p in plans]
+        changed = False
+        for p in plans:
+            try:
+                changed = svc.ensure_filled(db, p, today) or changed
+            except Exception as e:
+                print(f"Rollover fill failed for plan {p.id}: {e}")
+                db.rollback()
+        if changed:
+            db.commit()
 
-        today = date.today()
-        due_ids: list[int] = []
-        for plan in candidates:
-            days_left = (
-                plan.window_start
-                + timedelta(days=plan.window_days)
-                - today
-            ).days
-            # Fire whenever the current window is about to end OR
-            # has already ended. Negative values mean the rollover
-            # was missed (app was asleep / down) — we want to catch
-            # up in that case, not skip.
-            if days_left <= ROLLOVER_LOOKAHEAD_DAYS:
-                due_ids.append(plan.id)
-
-    for pid in due_ids:
+    refined = 0
+    for pid in plan_ids:
+        if refined >= MAX_REFINES_PER_TICK:
+            break
         try:
-            await extend_plan_window(pid)
+            if await refine_if_needed(pid, today):
+                refined += 1
         except Exception as e:
-            print(f"Rollover failed for plan {pid}: {e}")
+            print(f"Phase refine failed for plan {pid}: {e}")
 
 
 async def plan_rollover_loop():
-    """
-    Runs once at startup, then fires hourly. Extends any plan
-    whose current window is about to expire (or already has).
-    """
-    # Immediate pass so a fresh deploy doesn't wait an hour.
+    """Runs once at startup, then hourly."""
     try:
         await _rollover_tick()
     except Exception as e:

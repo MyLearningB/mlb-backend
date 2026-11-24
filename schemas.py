@@ -26,7 +26,24 @@ _MODE_ALIASES = {
     "flash cards": "flashcard",
     "feynman": "feynman",
     "feynman technique": "feynman",
+    # v2 plan modes
+    "learn": "learn",
+    "study": "learn",
+    "read": "learn",
+    "practice": "practice",
+    "practise": "practice",
+    "drill": "practice",
+    "mock": "mock",
+    "mock test": "mock",
+    "practice test": "mock",
+    "test": "mock",
+    "project": "project",
+    "build": "project",
 }
+
+PLAN_MODES = (
+    "learn", "practice", "review", "flashcard", "feynman", "mock", "project",
+)
 
 _PRIORITY_ALIASES = {
     "normal": "normal",
@@ -214,6 +231,10 @@ class TodayPlanSession(BaseModel):
     color_hex: Optional[str] = None
     # NEW — lets the chip render a strikethrough + tick.
     completed: bool = False
+    # v2 — what to do and when
+    time: Optional[str] = None
+    task: Optional[str] = None
+    skipped: bool = False
 
 
 class DashboardResponse(BaseModel):
@@ -262,14 +283,19 @@ class SessionDetail(BaseModel):
     time: Optional[str] = None
     subject: str
     topic: Optional[str] = None
+    # v2 — the concrete thing to do this session
+    task: Optional[str] = None
     subject_id: Optional[int] = None
     duration_mins: int
 
-    mode: Literal["flashcard", "feynman", "review"]
+    mode: Literal[
+        "learn", "practice", "review", "flashcard", "feynman", "mock", "project"
+    ]
     priority: Literal["normal", "high", "weak_area"]
 
     completed: bool
     skipped: bool = False
+    is_manual: bool = False
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -352,6 +378,36 @@ class PlanResponse(BaseModel):
 
     updated_at: Optional[datetime] = None
 
+    # ---- v2: flexible goal plans ----
+    goal_kind: Optional[str] = None          # exam | course | skill | habit
+    level: Optional[str] = None
+    summary: Optional[str] = None
+    schedule: Optional["PlanSchedule"] = None
+    roadmap: List["RoadmapPhase"] = Field(default_factory=list)
+    current_unit: Optional[str] = None
+    end_date: Optional[date] = None
+    roadmap_source: Optional[str] = None     # ai | cache | fallback
+    ai_plans_left: int = 0                   # AI builds/re-plans left today
+
+
+class PlanSchedule(BaseModel):
+    minutes_per_day: int
+    days_of_week: List[int]
+    preferred_times: List[str]
+
+
+class RoadmapPhase(BaseModel):
+    name: str
+    milestone: str = ""
+    weeks: int = 1
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    status: Literal["done", "current", "upcoming"] = "upcoming"
+    units: List[str] = Field(default_factory=list)
+
+
+PlanResponse.model_rebuild()
+
 
 # ==========================================
 # PLAN REQUESTS
@@ -378,24 +434,23 @@ class PlanSubjectInput(BaseModel):
 
 class PlanGenerateRequest(BaseModel):
     """
-    Two supported shapes:
+    v2 shape (preferred):
+      { "goal": "GRE in 10 months", "deadline": "2027-09-01",
+        "level": "intermediate", "minutes_per_day": 60,
+        "days_of_week": [1,2,3,4,5,6], "preferred_times": ["08:15", "19:00"],
+        "notes": "I struggle with geometry" }
 
-      1. Legacy single-goal:
-         { "goal": "WAEC Biology", "deadline": "2026-06-01" }
-
-      2. Multi-subject:
-         { "title": "Fall 2025", "plan_type": "semester",
-           "subjects": [{"name": "CHEM 201"}, {"name": "BIO 101"}] }
-
-    Both may be present — `subjects[]` wins when non-empty.
+    Older clients still work:
+      * `availability.minutes_per_day / study_days_per_week / earliest`
+      * `subjects[]` — names are joined into one goal, topics go to notes.
     """
     goal: Optional[str] = Field(default=None, min_length=1, max_length=200)
     deadline: Optional[date] = None
 
-    subjects: Optional[List[PlanSubjectInput]] = None
-    plan_type: Literal[
-        "single_goal", "exam_prep", "semester", "certification", "skill"
-    ] = "single_goal"
+    level: Optional[Literal["beginner", "intermediate", "advanced"]] = None
+    minutes_per_day: Optional[int] = Field(default=None, ge=10, le=600)
+    days_of_week: Optional[List[int]] = Field(default=None, max_length=7)
+    preferred_times: Optional[List[str]] = Field(default=None, max_length=3)
 
     goal_type: Optional[str] = None
 
@@ -403,10 +458,45 @@ class PlanGenerateRequest(BaseModel):
     emoji: Optional[str] = Field(default=None, max_length=10)
     color_hex: Optional[str] = Field(default=None, max_length=9)
 
-    availability: Optional[PlanAvailability] = None
-
     # Free-form hint the AI reads verbatim
     notes: Optional[str] = Field(default=None, max_length=1000)
+
+    # ---- legacy ----
+    availability: Optional[PlanAvailability] = None
+    subjects: Optional[List[PlanSubjectInput]] = None
+    plan_type: Optional[str] = None
+
+
+class PlanScheduleUpdate(BaseModel):
+    """Change when/how much you study. Free — no AI call."""
+    minutes_per_day: Optional[int] = Field(default=None, ge=10, le=600)
+    days_of_week: Optional[List[int]] = Field(default=None, min_length=1, max_length=7)
+    preferred_times: Optional[List[str]] = Field(default=None, min_length=1, max_length=3)
+    deadline: Optional[date] = None
+    clear_deadline: bool = False
+
+
+class PlanReplanRequest(BaseModel):
+    """Ask the AI to rebuild the rest of the plan. Uses one AI credit."""
+    feedback: Optional[str] = Field(default=None, max_length=500)
+    level: Optional[Literal["beginner", "intermediate", "advanced"]] = None
+
+
+class UpcomingSession(BaseModel):
+    id: str
+    plan_id: int
+    plan_title: str
+    emoji: Optional[str] = None
+    date: str
+    time: str
+    duration_mins: int
+    topic: Optional[str] = None
+    task: Optional[str] = None
+    mode: str
+
+
+class UpcomingResponse(BaseModel):
+    sessions: List[UpcomingSession]
 
 
 class PlanUpdateRequest(BaseModel):
