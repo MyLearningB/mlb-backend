@@ -795,6 +795,10 @@ class Flashcard(SQLModel, table=True):
         default=False,
     )
 
+    # NEW — when this card was last swiped. Lets the deck rotate:
+    # weak cards first, then the ones you haven't seen longest.
+    last_reviewed_at: Optional[datetime] = Field(default=None)
+
     study_set: Optional["StudySet"] = Relationship(
         back_populates="flashcards",
     )
@@ -861,6 +865,12 @@ class FeynmanSession(SQLModel, table=True):
     # NEW — XP for a Feynman session is granted exactly once.
     xp_awarded: bool = Field(
         default=False,
+    )
+
+    # NEW — last few chat turns (JSON list of {"role","text"}), so the
+    # coach remembers what was already said.
+    transcript: str = Field(
+        default="[]",
     )
 
     created_at: datetime = Field(
@@ -1616,3 +1626,35 @@ class PlanRoadmapCache(SQLModel, table=True):
     hits: int = Field(default=0)
 
     created_at: datetime = Field(default_factory=utc_now)
+
+
+# ==========================================
+# FLASHCARD SESSION (server-side record of one swipe run)
+# ==========================================
+#
+# The app used to get a random id that was never stored, so the
+# "complete" call could be repeated for free XP. Now the server
+# records when the run started, which cards were answered, and
+# grants XP once.
+
+class FlashcardSession(SQLModel, table=True):
+    id: str = Field(primary_key=True, max_length=36)
+
+    user_id: int = Field(
+        foreign_key="user.id",
+        ondelete="CASCADE",
+        index=True,
+    )
+
+    # JSON list of study set ids in this run
+    set_ids: str = Field(default="[]", max_length=500)
+
+    card_total: int = Field(default=0)
+    correct: int = Field(default=0)
+    incorrect: int = Field(default=0)
+
+    # JSON list of card ids already counted (no double counting)
+    answered: str = Field(default="[]")
+
+    started_at: datetime = Field(default_factory=utc_now)
+    completed_at: Optional[datetime] = Field(default=None)
